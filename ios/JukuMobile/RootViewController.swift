@@ -11,7 +11,7 @@ import WebKit
 /// | `ActionBar` 显隐                     | `setNavigationBarHidden`                   |
 /// | `onShowCustomView` 全屏              | `requestGeometryUpdate(.landscape)`        |
 /// | `DownloadManager`                   | `WKDownload`                               |
-/// | `onShowFileChooser`                 | `UIDocumentPickerViewController`           |
+/// | `onShowFileChooser`                 | 无需实现，WKWebView 自动弹系统选择器        |
 final class RootViewController: UIViewController {
 
     // MARK: - 依赖
@@ -32,7 +32,6 @@ final class RootViewController: UIViewController {
     private var updateCheckRunning = false
     private var didReportMainFrameError = false
     private var immersiveActive = false
-    private var filePickerCompletion: (([URL]?) -> Void)?
     private var toastAlert: UIAlertController?
 
     private static let brandOrange = UIColor(red: 0.94, green: 0.35, blue: 0.16, alpha: 1)
@@ -192,9 +191,14 @@ final class RootViewController: UIViewController {
     /// 升级后清一次网页缓存，避免旧前端资源残留（对应 Android `clearWebCacheAfterUpgrade`）。
     private func migrateWebCacheIfNeeded() {
         guard store.webCacheVersion < JukuConfig.currentVersionCode else { return }
+        // 必须显式传 completionHandler：
+        // iOS 15 起 WKWebsiteDataStore 也有 removeData(ofTypes:modifiedSince:) 的
+        // async 重载，不写 completionHandler 会被解析成 async 调用，
+        // 在非 async 函数里直接报 "'async' call in a function that does not support concurrency"。
         WKWebsiteDataStore.default().removeData(
             ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
-            modifiedSince: .distantPast
+            modifiedSince: .distantPast,
+            completionHandler: nil
         )
         store.webCacheVersion = JukuConfig.currentVersionCode
     }
@@ -589,20 +593,12 @@ extension RootViewController: WKDownloadDelegate {
 
 extension RootViewController: WKUIDelegate {
 
-    /// 网页 `<input type="file">` → 系统文件选择器。
-    func webView(_ webView: WKWebView,
-                 runOpenPanelWith parameters: WKOpenPanelParameters,
-                 initiatedByFrame frame: WKFrameInfo,
-                 completionHandler: @escaping ([URL]?) -> Void) {
-        filePickerCompletion = completionHandler
-        let picker = UIDocumentPickerViewController(
-            forOpeningContentTypes: [.item, .image, .movie, .audio],
-            asCopy: true
-        )
-        picker.allowsMultipleSelection = parameters.allowsMultipleSelection
-        picker.delegate = self
-        present(picker, animated: true)
-    }
+    // 注意：这里刻意**不实现** `webView(_:runOpenPanelWith:initiatedByFrame:completionHandler:)`。
+    // 该 delegate 在 iOS 上要 18.4+ 才可用（此前是 macOS 专属 API），
+    // 在 iOS 15 部署目标下直接报
+    //   "'WKOpenPanelParameters' is only available in iOS 18.4 or newer"。
+    // iOS 上 WKWebView 会自动为 <input type="file"> 弹出系统文件/照片选择器，
+    // 无需外壳介入，删掉是正确做法而非功能缺失。
 
     func webView(_ webView: WKWebView,
                  requestMediaCapturePermissionFor origin: WKSecurityOrigin,
@@ -610,22 +606,6 @@ extension RootViewController: WKUIDelegate {
                  type: WKMediaCaptureType,
                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
         decisionHandler(.grant)
-    }
-}
-
-// MARK: - UIDocumentPickerDelegate
-
-extension RootViewController: UIDocumentPickerDelegate {
-
-    func documentPicker(_ controller: UIDocumentPickerViewController,
-                        didPickDocumentsAt urls: [URL]) {
-        filePickerCompletion?(urls)
-        filePickerCompletion = nil
-    }
-
-    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        filePickerCompletion?(nil)
-        filePickerCompletion = nil
     }
 }
 

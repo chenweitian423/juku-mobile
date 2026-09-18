@@ -2,7 +2,6 @@ package com.juku.mobile;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
-import android.app.ActionBar;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.app.Notification;
@@ -30,8 +29,6 @@ import android.provider.Settings;
 import android.text.InputType;
 import android.text.method.LinkMovementMethod;
 import android.view.Gravity;
-import android.view.Menu;
-import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -52,6 +49,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -81,8 +79,8 @@ public class MainActivity extends Activity {
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.5";
-    private static final int CURRENT_VERSION_CODE = 14;
+    private static final String CURRENT_VERSION_NAME = "1.3.6";
+    private static final int CURRENT_VERSION_CODE = 15;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final long AUTO_UPDATE_INTERVAL_MS = 12L * 60L * 60L * 1000L;
@@ -93,7 +91,7 @@ public class MainActivity extends Activity {
     private static final int MAX_DOWNLOAD_RETRY = 2;
 
     private FrameLayout contentRoot;
-    private ActionBar actionBar;
+    private ImageButton fallbackMenuButton;
     private WebView webView;
     private ProgressBar progressBar;
     private TextView errorView;
@@ -163,10 +161,26 @@ public class MainActivity extends Activity {
         }
     };
 
-    private final class PlayerStateBridge {
+    private final class ShellBridge {
         @JavascriptInterface
         public void setPlayerState(boolean active, boolean controlsHidden) {
-            runOnUiThread(() -> syncNativeActionBar(active, controlsHidden));
+            runOnUiThread(() -> syncImmersiveMode(active, controlsHidden));
+        }
+
+        /** 注入到网页头部的菜单按钮被点击时调用。 */
+        @JavascriptInterface
+        public void openMenu() {
+            runOnUiThread(MainActivity.this::showShellMenu);
+        }
+
+        /** 注入失败（网页没有预期的头部结构）时调用，退回到原生悬浮按钮。 */
+        @JavascriptInterface
+        public void menuButtonUnavailable() {
+            runOnUiThread(() -> {
+                if (fallbackMenuButton != null) {
+                    fallbackMenuButton.setVisibility(View.VISIBLE);
+                }
+            });
         }
     }
 
@@ -223,7 +237,25 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
         setContentView(contentRoot);
-        actionBar = getActionBar();
+        installFallbackMenuButton();
+    }
+
+    /**
+     * 兜底菜单入口：默认隐藏，只有当注入到网页头部的按钮装不上时
+     * （网页结构变了、或还没加载完）才显示，保证菜单永远可达。
+     */
+    private void installFallbackMenuButton() {
+        fallbackMenuButton = new ImageButton(this);
+        fallbackMenuButton.setImageResource(android.R.drawable.ic_menu_more);
+        fallbackMenuButton.setBackgroundColor(Color.argb(150, 15, 17, 21));
+        fallbackMenuButton.setContentDescription("更多设置");
+        fallbackMenuButton.setVisibility(View.GONE);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(40), dp(40));
+        params.gravity = Gravity.TOP | Gravity.END;
+        params.topMargin = dp(6);
+        params.rightMargin = dp(6);
+        fallbackMenuButton.setOnClickListener(view -> showShellMenu());
+        contentRoot.addView(fallbackMenuButton, params);
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -249,7 +281,7 @@ public class MainActivity extends Activity {
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
         settings.setUserAgentString(settings.getUserAgentString() + " JukuMobile/" + CURRENT_VERSION_NAME);
         clearWebCacheAfterUpgrade();
-        webView.addJavascriptInterface(new PlayerStateBridge(), "JukuShell");
+        webView.addJavascriptInterface(new ShellBridge(), "JukuShell");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -272,7 +304,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
-                installPlayerActionBarBridge();
+                installShellBridge();
                 maybeAutoCheckUpdate();
             }
 
@@ -340,7 +372,6 @@ public class MainActivity extends Activity {
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT));
                 webView.setVisibility(View.GONE);
-                hideNativeActionBar();
                 applyImmersiveMode(true);
             }
 
@@ -402,8 +433,34 @@ public class MainActivity extends Activity {
         webView.loadUrl(address);
     }
 
-    private void installPlayerActionBarBridge() {
+    private void installShellBridge() {
         String script = "(function(){"
+                // 菜单按钮注入：网页自己的 .app-header 里已有 .header-actions，
+                // 在那里插一个同款图标按钮，就不再需要原生 ActionBar（避免重复占一行）。
+                // 这段必须放在 __jukuShellBridgeInstalled 短路之前 —— SPA 切换会重建头部 DOM，
+                // 每次页面加载都要重新注入。
+                + "var installMenu=function(){"
+                + "var actions=document.querySelector('.app-header .header-actions');"
+                + "if(!actions){return false;}"
+                + "if(actions.querySelector('.juku-shell-menu')){return true;}"
+                + "var btn=document.createElement('button');"
+                + "btn.type='button';"
+                + "btn.className='icon-button juku-shell-menu';"
+                + "btn.setAttribute('aria-label','更多设置');"
+                + "btn.title='更多设置';"
+                + "btn.textContent='\\u22EF';"
+                + "btn.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();"
+                + "try{JukuShell.openMenu();}catch(err){}});"
+                + "actions.insertBefore(btn,actions.firstChild);"
+                + "return true;};"
+                + "var menuTries=0;"
+                + "var menuTimer=setInterval(function(){"
+                + "menuTries++;"
+                + "if(installMenu()||menuTries>20){"
+                + "clearInterval(menuTimer);"
+                // 20 次（10 秒）都装不上 => 网页结构变了，退回到原生悬浮按钮，保证菜单可达
+                + "if(!installMenu()){try{JukuShell.menuButtonUnavailable();}catch(err){}}"
+                + "}},500);"
                 + "if(window.__jukuShellBridgeInstalled){return;}"
                 + "window.__jukuShellBridgeInstalled=true;"
                 + "var sync=function(){"
@@ -426,36 +483,50 @@ public class MainActivity extends Activity {
         webView.evaluateJavascript(script, null);
     }
 
-    private void syncNativeActionBar(boolean playerActive, boolean controlsHidden) {
-        if (!playerActive || !controlsHidden) {
-            showNativeActionBar();
+    /**
+     * 播放器状态同步。已经没有原生 ActionBar 可显示了，这里只负责沉浸（隐藏状态栏）。
+     *
+     * 注意：**不做任何系统方向旋转**。网页的横竖屏是它自己用 CSS 旋转实现的
+     * （见服务端 /assets/player-orientation.js），外壳插手会与页面旋转叠加，
+     * 导致「一进播放器就被强制横屏」以及页面命中区域错位。
+     */
+    private void syncImmersiveMode(boolean playerActive, boolean controlsHidden) {
+        applyImmersiveMode(playerActive && controlsHidden);
+    }
+
+    /** 外壳菜单。原来挂在 ActionBar 上，现在由网页头部的注入按钮触发。 */
+    private void showShellMenu() {
+        if (isFinishing()) {
             return;
         }
-        hideNativeActionBar();
-    }
-
-    private void showNativeActionBar() {
-        if (customView != null) {
-            return;
-        }
-        ActionBar bar = currentActionBar();
-        if (bar != null && !bar.isShowing()) {
-            bar.show();
-        }
-    }
-
-    private void hideNativeActionBar() {
-        ActionBar bar = currentActionBar();
-        if (bar != null && bar.isShowing()) {
-            bar.hide();
-        }
-    }
-
-    private ActionBar currentActionBar() {
-        if (actionBar == null) {
-            actionBar = getActionBar();
-        }
-        return actionBar;
+        String[] items = {"服务器地址", "刷新", "检查更新", "回到首页", "关于"};
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.app_name)
+                .setItems(items, (dialog, which) -> {
+                    switch (which) {
+                        case 0:
+                            showServerDialog();
+                            break;
+                        case 1:
+                            showingError = false;
+                            errorView.setVisibility(View.GONE);
+                            webView.reload();
+                            break;
+                        case 2:
+                            checkForUpdate(true);
+                            break;
+                        case 3:
+                            String address = preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL);
+                            webView.loadUrl(normalizeServerUrl(address));
+                            break;
+                        case 4:
+                            showAboutDialog();
+                            break;
+                        default:
+                            break;
+                    }
+                })
+                .show();
     }
 
     private boolean isLegacyInternalServer(String address) {
@@ -1421,7 +1492,6 @@ public class MainActivity extends Activity {
             customViewCallback = null;
         }
         applyImmersiveMode(false);
-        showNativeActionBar();
     }
 
     private void applyImmersiveMode(boolean enabled) {
@@ -1475,40 +1545,8 @@ public class MainActivity extends Activity {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
-    @Override
-    public boolean onCreateOptionsMenu(Menu menu) {
-        getMenuInflater().inflate(R.menu.main_menu, menu);
-        return true;
-    }
-
-    @Override
-    public boolean onOptionsItemSelected(MenuItem item) {
-        int id = item.getItemId();
-        if (id == R.id.action_server) {
-            showServerDialog();
-            return true;
-        }
-        if (id == R.id.action_reload) {
-            showingError = false;
-            errorView.setVisibility(View.GONE);
-            webView.reload();
-            return true;
-        }
-        if (id == R.id.action_update) {
-            checkForUpdate(true);
-            return true;
-        }
-        if (id == R.id.action_home) {
-            String address = preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL);
-            webView.loadUrl(normalizeServerUrl(address));
-            return true;
-        }
-        if (id == R.id.action_about) {
-            showAboutDialog();
-            return true;
-        }
-        return super.onOptionsItemSelected(item);
-    }
+    // 外壳菜单不再走 ActionBar（已改用 NoActionBar 主题 + 网页头部注入按钮），
+    // 菜单项的响应逻辑统一在 showShellMenu() 里。
 
     @Override
     public void onBackPressed() {

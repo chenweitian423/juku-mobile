@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="AppTheme" parent="@android:style/Theme.Material">
+    <!-- 用 NoActionBar：网页自己的 .app-header 已经有品牌名与菜单，
+         原生 ActionBar 再显示一遍「果果剧库」会重复占掉一整行，把内容压下去。
+         外壳菜单改由注入到网页头部的按钮触发（见 MainActivity 的 installShellBridge）。 -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:windowActionModeOverlay">true</item>
         <item name="android:windowBackground">@color/app_background</item>

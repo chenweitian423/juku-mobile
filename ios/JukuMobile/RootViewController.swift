@@ -33,6 +33,8 @@ final class RootViewController: UIViewController {
     private var didReportMainFrameError = false
     private var immersiveActive = false
     private var toastAlert: UIAlertController?
+    /// 兜底菜单入口：默认隐藏，只在注入网页头部失败时显示。
+    private var fallbackMenuButton: UIButton?
 
     private static let brandOrange = UIColor(red: 0.94, green: 0.35, blue: 0.16, alpha: 1)
     private static let appBackground = UIColor(red: 0.059, green: 0.067, blue: 0.082, alpha: 1)
@@ -70,23 +72,10 @@ final class RootViewController: UIViewController {
     // MARK: - 界面搭建
 
     private func configureNavigationItem() {
-        let appearance = UINavigationBarAppearance()
-        appearance.configureWithOpaqueBackground()
-        appearance.backgroundColor = Self.appBackground
-        appearance.titleTextAttributes = [.foregroundColor: UIColor.white]
-        appearance.buttonAppearance.normal.titleTextAttributes = [.foregroundColor: Self.brandOrange]
-
-        navigationItem.standardAppearance = appearance
-        navigationItem.scrollEdgeAppearance = appearance
-
-        let menuButton = UIBarButtonItem(
-            image: UIImage(systemName: "ellipsis.circle"),
-            style: .plain,
-            target: self,
-            action: #selector(presentMenu)
-        )
-        menuButton.accessibilityLabel = "菜单"
-        navigationItem.rightBarButtonItem = menuButton
+        // 导航栏常驻隐藏：网页自己的 `.app-header` 已经有品牌名与菜单，
+        // 原生导航栏再显示一遍标题会重复占掉一整行，把内容压下去。
+        // 外壳菜单改由注入到网页头部的按钮触发（见 injectShellBridge）。
+        navigationController?.setNavigationBarHidden(true, animated: false)
     }
 
     private func configureWebView() {
@@ -137,6 +126,26 @@ final class RootViewController: UIViewController {
         progressBar.isHidden = true
         view.addSubview(progressBar)
         self.progressBar = progressBar
+
+        // 兜底菜单入口：默认隐藏，只有注入网页头部失败时才显示，保证菜单永远可达
+        let menuButton = UIButton(type: .system)
+        menuButton.translatesAutoresizingMaskIntoConstraints = false
+        menuButton.setImage(UIImage(systemName: "ellipsis"), for: .normal)
+        menuButton.tintColor = .white
+        menuButton.backgroundColor = UIColor(white: 0.06, alpha: 0.72)
+        menuButton.layer.cornerRadius = 18
+        menuButton.isHidden = true
+        menuButton.accessibilityLabel = "更多设置"
+        menuButton.addTarget(self, action: #selector(fallbackMenuTapped), for: .touchUpInside)
+        view.addSubview(menuButton)
+        self.fallbackMenuButton = menuButton
+
+        NSLayoutConstraint.activate([
+            menuButton.widthAnchor.constraint(equalToConstant: 36),
+            menuButton.heightAnchor.constraint(equalToConstant: 36),
+            menuButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -6),
+            menuButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 6)
+        ])
 
         let errorContainer = UIView()
         errorContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -232,8 +241,7 @@ final class RootViewController: UIViewController {
         let immersive = active && landscape && controlsHidden
         guard immersive != immersiveActive else { return }
         immersiveActive = immersive
-
-        navigationController?.setNavigationBarHidden(immersive, animated: true)
+        // 导航栏本来就是常驻隐藏的（见 configureNavigationItem），这里只切换状态栏
         setNeedsStatusBarAppearanceUpdate()
     }
 
@@ -249,7 +257,12 @@ final class RootViewController: UIViewController {
 
     // MARK: - 菜单
 
-    @objc private func presentMenu() {
+    @objc private func fallbackMenuTapped() {
+        presentShellMenu()
+    }
+
+    /// 外壳菜单。原来挂在导航栏按钮上，现在由网页头部的注入按钮触发。
+    private func presentShellMenu() {
         let sheet = UIAlertController(title: "果果剧库", message: nil, preferredStyle: .actionSheet)
         sheet.addAction(UIAlertAction(title: "服务器地址", style: .default) { [weak self] _ in
             self?.presentServerDialog()
@@ -268,9 +281,12 @@ final class RootViewController: UIViewController {
         })
         sheet.addAction(UIAlertAction(title: "取消", style: .cancel))
 
-        // iPad 上 actionSheet 必须有锚点，否则崩溃。
+        // 导航栏已常驻隐藏，iPad 上不再有 barButtonItem 可作锚点，
+        // 改用视图中心（actionSheet 无锚点会崩）。
         if let popover = sheet.popoverPresentationController {
-            popover.barButtonItem = navigationItem.rightBarButtonItem
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
         }
         present(sheet, animated: true)
     }
@@ -437,6 +453,10 @@ extension RootViewController: WKScriptMessageHandler {
             let hidden = (body["hidden"] as? NSNumber)?.boolValue ?? false
             let landscape = (body["landscape"] as? NSNumber)?.boolValue ?? false
             applyPlayerState(active: active, controlsHidden: hidden, landscape: landscape)
+        case "openMenu":
+            presentShellMenu()
+        case "menuUnavailable":
+            fallbackMenuButton?.isHidden = false
         case "ready":
             injectShellBridge()
         default:
@@ -641,6 +661,41 @@ extension RootViewController {
               });
             } catch (e) {}
           };
+          window.JukuShell.openMenu = function(){
+            try { window.webkit.messageHandlers.\(JukuConfig.shellHandlerName).postMessage({ type: 'openMenu' }); } catch (e) {}
+          };
+          window.JukuShell.menuButtonUnavailable = function(){
+            try { window.webkit.messageHandlers.\(JukuConfig.shellHandlerName).postMessage({ type: 'menuUnavailable' }); } catch (e) {}
+          };
+          // 菜单按钮注入：网页自己的 .app-header 里已有 .header-actions，
+          // 在那里插一个同款按钮，就不需要原生导航栏（避免重复占一行）。
+          // 这段必须放在 __jukuShellBridgeInstalled 短路之前 —— SPA 会重建头部 DOM，
+          // 每次页面加载都要重新注入。
+          var jukuInstallMenu = function(){
+            var actions = document.querySelector('.app-header .header-actions');
+            if (!actions) { return false; }
+            if (actions.querySelector('.juku-shell-menu')) { return true; }
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'icon-button juku-shell-menu';
+            btn.setAttribute('aria-label', '更多设置');
+            btn.title = '更多设置';
+            btn.textContent = '\\u22EF';
+            btn.addEventListener('click', function(e){
+              e.preventDefault(); e.stopPropagation();
+              window.JukuShell.openMenu();
+            });
+            actions.insertBefore(btn, actions.firstChild);
+            return true;
+          };
+          var jukuMenuTries = 0;
+          var jukuMenuTimer = setInterval(function(){
+            jukuMenuTries++;
+            if (jukuInstallMenu() || jukuMenuTries > 20) {
+              clearInterval(jukuMenuTimer);
+              if (!jukuInstallMenu()) { window.JukuShell.menuButtonUnavailable(); }
+            }
+          }, 500);
           if (window.__jukuShellBridgeInstalled) { return; }
           window.__jukuShellBridgeInstalled = true;
           var sync = function(){

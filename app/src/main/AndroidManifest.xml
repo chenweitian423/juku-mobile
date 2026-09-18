@@ -21,10 +21,20 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
+        <!--
+          exported 必须为 true。
+          安装时系统安装器**不是唯一的读取方**：国产 ROM（MIUI/HyperOS 等）在弹出安装界面
+          之前会由「安全中心 / 病毒扫描」这类**独立进程**去读这个 URI，而 URI 的临时授权
+          （FLAG_GRANT_READ_URI_PERMISSION）只授予了安装器本身，扫描进程拿不到 →
+          读取被拒 → 用户看到「解析软件包时出现问题。(11) Failed opening content provider」。
+          exported=false 会让这个链路 100% 失败（模拟器上的 AOSP 安装器没有这一步，所以测不出来）。
+          安全边界改为放在 Provider 内部：只读、只暴露 cacheDir/updates 下的 *.apk，
+          文件名还要匹配白名单正则、拒绝路径穿越 —— 也就是只可能读到「本来就是公开下载的安装包」。
+        -->
         <provider
             android:name=".ApkFileProvider"
             android:authorities="${applicationId}.apk"
-            android:exported="false"
+            android:exported="true"
             android:grantUriPermissions="true" />
         <activity
             android:name=".MainActivity"

@@ -87,8 +87,8 @@ public class MainActivity extends Activity {
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.11";
-    private static final int CURRENT_VERSION_CODE = 20;
+    private static final String CURRENT_VERSION_NAME = "1.3.12";
+    private static final int CURRENT_VERSION_CODE = 21;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1003;
@@ -274,11 +274,13 @@ public class MainActivity extends Activity {
         buildContentView();
         registerInstallReceiver();
         configureWebView();
-        // 启动时清掉更新缓存里的历史安装包：既避免旧包被误安装（见 finishDownloadSuccess），
-        // 也避免这些几十 KB 的残留长期占着缓存。属于磁盘 IO，放到后台线程做，
-        // 不占冷启动的主线程时间。
-        new Thread(() -> removeOtherApks(new File(getCacheDir(), "updates"), null),
-                "juku-cache-cleanup").start();
+        // 启动时回收「一天前」的残留安装包。★ 这里刻意只删过期的、绝不清空目录：
+        // 下载完成 → 拉起系统安装器 → 厂商扫描/用户确认可能耗时较长，期间若本 Activity
+        // 被重建（配置变化、安装器切换任务栈等），清空目录会把**正在安装的那个包删掉**，
+        // 安装器随后读 provider 得到「update file not found」，用户看到的却又是
+        // 「解析软件包时出现问题」。属于磁盘 IO，放到后台线程，不占冷启动主线程时间。
+        new Thread(() -> removeExpiredApks(new File(getCacheDir(), "updates"),
+                24L * 60L * 60L * 1000L), "juku-cache-cleanup").start();
         if (savedInstanceState == null || webView.restoreState(savedInstanceState) == null) {
             loadConfiguredServer();
         }
@@ -1413,6 +1415,15 @@ public class MainActivity extends Activity {
      * 两个目的：① 不让历史残留包有机会被安装（见 finishDownloadSuccess 的说明）；
      * ② 不长期占存储。
      */
+    /**
+     * 清理更新缓存目录里「与本次无关」的安装包。
+     *
+     * ★ 只在**下载之前**调用（keep = 即将下载的目标文件）。
+     * 绝不能在启动时把目录清空：下载完成 → 拉起系统安装器 → 扫描/确认可能耗时较长，
+     * 期间若本 Activity 被重建（配置变化、厂商安装器切换任务栈等），
+     * 启动清理会把**正在安装的那个包删掉**，安装器随后读 provider 得到
+     * 「update file not found」，用户看到的却是「解析软件包时出现问题」。
+     */
     private void removeOtherApks(File directory, File keep) {
         File[] files = directory.listFiles();
         if (files == null) {
@@ -1427,6 +1438,29 @@ public class MainActivity extends Activity {
             }
             if (file.delete()) {
                 Log.i(LOG_TAG, "removed stale update file " + file.getName());
+            }
+        }
+    }
+
+    /**
+     * 启动时的缓存回收：只删「一天前的」残留包，不动最近下载的。
+     * 这些包只有几十 KB，目的只是别让它们长期堆积，不值得冒误删的风险。
+     */
+    private void removeExpiredApks(File directory, long maxAgeMs) {
+        File[] files = directory.listFiles();
+        if (files == null) {
+            return;
+        }
+        long deadline = System.currentTimeMillis() - maxAgeMs;
+        for (File file : files) {
+            if (!file.isFile() || !file.getName().endsWith(".apk")) {
+                continue;
+            }
+            if (file.lastModified() > deadline) {
+                continue;
+            }
+            if (file.delete()) {
+                Log.i(LOG_TAG, "recycled expired update file " + file.getName());
             }
         }
     }
@@ -1592,7 +1626,10 @@ public class MainActivity extends Activity {
             installWithPackageInstaller(apk);
         } catch (Exception error) {
             pendingInstallFile = null;
-            noteUpdateStep("会话安装失败，改用系统安装器：" + updateError(error));
+            // 带上异常类名：PackageInstaller 在部分 ROM 上抛 SecurityException
+            // （「不允许安装」），和一般的 IO 异常处理方式不同，日志里必须能区分开。
+            noteUpdateStep("会话安装失败（" + error.getClass().getSimpleName() + "）："
+                    + updateError(error) + "，改用系统安装器");
             runOnUiThread(() -> installWithViewer(apk));
         }
     }
@@ -1732,19 +1769,22 @@ public class MainActivity extends Activity {
      * 触发安装器，兼容性明显更好；若系统只有一个安装器入口，行为一致。
      */
     private void installWithViewer(File apk) {
-        noteUpdateStep("改用系统安装器打开：" + apk.getName());
+        noteUpdateStep("改用系统安装器打开：" + apk.getName() + "（" + apk.length() + " B）");
         Uri uri = ApkFileProvider.uriForFile(this, apk);
         String mime = "application/vnd.android.package-archive";
 
         Intent viewIntent = new Intent(Intent.ACTION_VIEW);
         viewIntent.setDataAndType(uri, mime);
         viewIntent.setClipData(ClipData.newUri(getContentResolver(), "果果剧库更新", uri));
+        // 授权给安装器本身；但注意国产 ROM 的「安全扫描」是独立进程，拿不到这个授权，
+        // 所以 provider 必须导出（见 ApkFileProvider 的类注释）。
         viewIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         viewIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
             startActivity(viewIntent);
+            noteUpdateStep("已拉起系统安装器（ACTION_VIEW）");
             return;
-        } catch (ActivityNotFoundException ignored) {
+        } catch (ActivityNotFoundException | SecurityException ignored) {
             // 继续尝试 ACTION_INSTALL_PACKAGE 作为兜底
         }
 
@@ -1755,7 +1795,9 @@ public class MainActivity extends Activity {
         installIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
             startActivity(installIntent);
-        } catch (ActivityNotFoundException ignored) {
+            noteUpdateStep("已拉起系统安装器（ACTION_INSTALL_PACKAGE）");
+        } catch (ActivityNotFoundException | SecurityException error) {
+            noteUpdateStep("找不到可用的系统安装器：" + updateError(error));
             Toast.makeText(this,
                     "没有找到系统安装器，请到浏览器打开下载页手动安装", Toast.LENGTH_LONG).show();
         }

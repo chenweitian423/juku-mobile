@@ -85,8 +85,8 @@ public class MainActivity extends Activity {
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.9";
-    private static final int CURRENT_VERSION_CODE = 18;
+    private static final String CURRENT_VERSION_NAME = "1.3.10";
+    private static final int CURRENT_VERSION_CODE = 19;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final long AUTO_UPDATE_INTERVAL_MS = 12L * 60L * 60L * 1000L;
@@ -108,7 +108,7 @@ public class MainActivity extends Activity {
     private ProgressBar downloadProgress;
     private TextView downloadStatus;
     private HttpURLConnection activeUpdateConnection;
-    private File pendingInstallFile;
+    private volatile File pendingInstallFile;
     private boolean showingError;
     private boolean updateCheckRunning;
     private boolean autoUpdateChecked;
@@ -1404,47 +1404,71 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * 安装更新包。
+     *
+     * ★ 解析 APK、比对签名、写入安装会话都是 IO，**必须离开主线程**：
+     * 之前这些都在 UI 线程上做，实测在（较慢的）设备上会长时间阻塞主线程，
+     * 系统弹出「应用无响应」对话框 —— 用户体感就是「点了下载并安装之后卡住」。
+     */
     private void installApk(File apk) {
         noteUpdateStep("开始安装：" + apk.getName() + " " + apk.length() + " B");
+        new Thread(() -> prepareAndInstall(apk), "juku-install").start();
+    }
+
+    private void prepareAndInstall(File apk) {
         // 预检 1：包本身是否可解析、包名是否匹配
         String localIssue = precheckApk(apk);
         if (localIssue != null) {
             noteUpdateStep("安装前预检未通过：" + localIssue);
-            Toast.makeText(this, "更新包有问题：" + localIssue, Toast.LENGTH_LONG).show();
+            runOnUiThread(() -> {
+                if (!isFinishing()) {
+                    Toast.makeText(this, "更新包有问题：" + localIssue, Toast.LENGTH_LONG).show();
+                }
+            });
             return;
         }
         // 预检 2：签名是否与已安装版本一致 —— 不一致时系统必然拒绝，提前给出指引
         if (hasSignatureConflict(apk)) {
             noteUpdateStep("签名与已安装版本不一致");
-            showSignatureConflictGuide(apk);
+            runOnUiThread(() -> showSignatureConflictGuide(apk));
             return;
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 && !getPackageManager().canRequestPackageInstalls()) {
-            pendingInstallFile = apk;
-            new AlertDialog.Builder(this, R.style.JukuDialogTheme)
-                    .setTitle("需要安装权限")
-                    .setMessage("请允许“果果剧库”安装应用，返回后会自动继续安装。")
-                    .setPositiveButton("去开启", (dialog, which) -> {
-                        Intent settings = new Intent(
-                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                Uri.parse("package:" + getPackageName()));
-                        try {
-                            startActivityForResult(settings, INSTALL_PERMISSION_REQUEST);
-                        } catch (ActivityNotFoundException error) {
-                            Toast.makeText(this, "无法打开安装权限设置页", Toast.LENGTH_LONG).show();
-                        }
-                    })
-                    .setNegativeButton("取消", (dialog, which) -> pendingInstallFile = null)
-                    .show();
+            runOnUiThread(() -> showInstallPermissionDialog(apk));
             return;
         }
         try {
             installWithPackageInstaller(apk);
         } catch (Exception error) {
             pendingInstallFile = null;
-            installWithViewer(apk);
+            noteUpdateStep("会话安装失败，改用系统安装器：" + updateError(error));
+            runOnUiThread(() -> installWithViewer(apk));
         }
+    }
+
+    /** 「需要安装权限」对话框：去系统设置里允许安装未知应用，回来自动继续。 */
+    private void showInstallPermissionDialog(File apk) {
+        if (isFinishing()) {
+            return;
+        }
+        pendingInstallFile = apk;
+        new AlertDialog.Builder(this, R.style.JukuDialogTheme)
+                .setTitle("需要安装权限")
+                .setMessage("请允许“果果剧库”安装应用，返回后会自动继续安装。")
+                .setPositiveButton("去开启", (dialog, which) -> {
+                    Intent settings = new Intent(
+                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:" + getPackageName()));
+                    try {
+                        startActivityForResult(settings, INSTALL_PERMISSION_REQUEST);
+                    } catch (ActivityNotFoundException error) {
+                        Toast.makeText(this, "无法打开安装权限设置页", Toast.LENGTH_LONG).show();
+                    }
+                })
+                .setNegativeButton("取消", (dialog, which) -> pendingInstallFile = null)
+                .show();
     }
 
     /** 比对更新包与已安装应用的签名证书是否一致。 */

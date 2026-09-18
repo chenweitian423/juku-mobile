@@ -83,12 +83,24 @@ CI 在出包后会断言证书指纹等于 `b23d08d3e4e21b051ecc09e8277b669d8b60
 
 ### 发布新版本的操作顺序
 
+一条命令（拉取 + 配对校验 + 推送 + 公网回验）：
+
+```bash
+./ship.sh              # 最新 Release
+./ship.sh v1.3.5       # 指定版本
+```
+
+它内部就是 `fetch-artifacts.sh` + `publish-to-server.sh`，也可以分步跑。
+推送脚本有三道防护：**推前**校验 `update.json` 与 APK 的 sha256/size 配对、
+**推后**从公网重新下载逐个核对、**推前**把服务端旧文件备份到宿主机 `/tmp`。
+
+手动等价步骤：
 1. 改版本号（`app/build.gradle` + `ios/project.yml`，两端必须一致）
-2. 提交推送，等 `Build Android APK` 跑完
-3. `./fetch-artifacts.sh` 把产物拉到 `dist/`
-4. 把 `dist/juku-mobile-<版本>.apk` 传到服务端 `/data/mobile/juku-mobile.apk`
-5. 把 `dist/update.json` **整份替换**服务端 `/data/mobile/update.json`
-   （`apkName` 已按服务端约定写成 `juku-mobile.apk`，无需改动）
+2. 提交推送等 `Build Android APK` 跑完；iOS 另跑 `Build iOS IPA`
+3. 产物下载到 `dist/`：APK、IPA、`update.json`
+4. `dist/juku-mobile-<版本>.apk` → 服务端 `/data/mobile/juku-mobile.apk`
+5. `dist/juku-mobile-<版本>-unsigned.ipa` → `/data/mobile/juku-mobile-unsigned.ipa`
+6. `dist/update.json` → `/data/mobile/update.json`
 
 > ⚠️ **APK 的 sha256 每次构建都会变，且不可复现**：AGP 产出的 zip 条目时间戳随构建时间变化，
 > 同源码重复构建（甚至设 `SOURCE_DATE_EPOCH`）也拿不到相同摘要。
@@ -101,8 +113,12 @@ CI 在出包后会断言证书指纹等于 `b23d08d3e4e21b051ecc09e8277b669d8b60
 | | Android | iOS |
 |---|---|---|
 | 检查更新 | 请求同一接口 | 请求同一接口 |
-| 下载 | 应用内下载 + 断点续传 | 跳转浏览器 / GitHub Releases |
+| 下载 | 应用内下载 + 断点续传 | 优先服务端 IPA，回退 GitHub Releases |
 | 安装 | `ACTION_VIEW` 交给系统安装器，支持应用内直接升级 | **不允许**应用自行安装，需用 AltStore / Sideloadly / TrollStore 自签 |
+
+iOS 的下载地址按**服务端约定**拼（`api/mobile/apk?name=juku-mobile-unsigned.ipa`），
+而不是读服务端下发的字段 —— 实测服务端 `api/mobile/update` 会**重新序列化** `update.json`，
+只回传它认识的字段（`apkUrl` / `versionCode` / `sha256` …），自定义字段（如 `ipaUrl`）会被丢弃。
 
 签名一致时 Android 可长期走应用内覆盖升级；一旦换钥匙，老用户必须先卸载再装。
 

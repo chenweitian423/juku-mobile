@@ -64,8 +64,10 @@ jobs:
         id: version
         run: |
           set -euo pipefail
+          # 正则只用 BRE 标准语法（[0-9][0-9]* 而非 GNU 扩展的 [0-9]\+），
+          # 这样在 GNU sed 与 BSD sed 上行为一致。
           NAME=$(sed -n 's/.*versionName "\(.*\)".*/\1/p' app/build.gradle | head -n1)
-          CODE=$(sed -n 's/.*versionCode \([0-9]\+\).*/\1/p' app/build.gradle | head -n1)
+          CODE=$(sed -n 's/.*versionCode \([0-9][0-9]*\).*/\1/p' app/build.gradle | head -n1)
           if [ -z "$NAME" ] || [ -z "$CODE" ]; then
             echo "::error::无法从 app/build.gradle 解析 versionName / versionCode"
             exit 1

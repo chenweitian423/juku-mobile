@@ -32,13 +32,22 @@ jobs:
       - name: Verify version parity with Android
         run: |
           set -euo pipefail
+          # 正则只用 BRE 标准语法。
+          # 不能用 GNU 扩展的 \+ —— macOS 是 BSD sed，会把它当字面量匹配不上，
+          # 导致 versionCode 解析为空、误报两端版本不一致。
           ANDROID_VERSION=$(sed -n 's/.*versionName "\(.*\)".*/\1/p' app/build.gradle | head -n1)
-          ANDROID_CODE=$(sed -n 's/.*versionCode \([0-9]\+\).*/\1/p' app/build.gradle | head -n1)
+          ANDROID_CODE=$(sed -n 's/.*versionCode \([0-9][0-9]*\).*/\1/p' app/build.gradle | head -n1)
           IOS_VERSION=$(sed -n 's/^ *MARKETING_VERSION: *"\(.*\)".*/\1/p' ios/project.yml | head -n1)
           IOS_CODE=$(sed -n 's/^ *CURRENT_PROJECT_VERSION: *"\(.*\)".*/\1/p' ios/project.yml | head -n1)
 
           echo "Android: $ANDROID_VERSION ($ANDROID_CODE)"
           echo "iOS    : $IOS_VERSION ($IOS_CODE)"
+
+          if [ -z "$ANDROID_VERSION" ] || [ -z "$ANDROID_CODE" ] \
+             || [ -z "$IOS_VERSION" ] || [ -z "$IOS_CODE" ]; then
+            echo "::error::版本号解析失败，检查 app/build.gradle / ios/project.yml 的字段格式"
+            exit 1
+          fi
 
           if [ "$ANDROID_VERSION" != "$IOS_VERSION" ] || [ "$ANDROID_CODE" != "$IOS_CODE" ]; then
             echo "::error::两端版本号不一致，请同步 app/build.gradle 与 ios/project.yml"

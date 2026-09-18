@@ -260,7 +260,8 @@ jobs:
             gh release create "$TAG" "$APK" artifacts/update.json \
               --title "果果剧库 ${VERSION_NAME}" \
               --notes-file "$RUNNER_TEMP/notes.md" \
-              --latest
+              --latest \
+              || gh release upload "$TAG" "$APK" artifacts/update.json --clobber
           fi
 
       - name: Job summary

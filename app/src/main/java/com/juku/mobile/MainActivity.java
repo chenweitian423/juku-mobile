@@ -19,6 +19,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.InstallSourceInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
@@ -123,6 +124,18 @@ public class MainActivity extends Activity {
     private static final int NOTIFICATION_ID_UPDATE = 0x4A55; // "JU"
     private static final int MAX_DOWNLOAD_RETRY = 2;
 
+    /**
+     * 安装会话看门狗。
+     *
+     * `PackageInstaller.commit()` 之后，正常情况系统会立刻回一个广播
+     * （`STATUS_PENDING_USER_ACTION` 让我们拉起确认界面，或直接 SUCCESS/FAILURE）。
+     * 但实测在部分 ROM + 特定安装来源组合下，**广播压根不来、确认界面也不出现**，
+     * 于是界面停在那里什么都不发生 —— 用户看到的就是「点了下载没反应」。
+     * 超时后主动换系统安装器兜底，把"静默"变成"有结果"。
+     */
+    private static final long INSTALL_SESSION_WATCHDOG_MS = 15_000L;
+    private static final String KEY_PENDING_INSTALL_CODE = "pending_install_code";
+
     private FrameLayout contentRoot;
     private TextView fallbackMenuButton;
     private boolean immersiveNow;
@@ -151,6 +164,26 @@ public class MainActivity extends Activity {
     private boolean autoUpdateChecked;
     private boolean installReceiverRegistered;
     private volatile boolean downloadCancelled;
+    /** 安装会话已 commit、但还没收到任何结果广播 —— 看门狗据此决定要不要兜底。 */
+    private boolean installSessionAwaitingResult;
+    /**
+     * 我们是否**成功**把系统安装确认界面拉起来过。
+     *
+     * 这个标志比"本 Activity 是否在前台"更精确：系统确认界面起来后我们必然被压到后台，
+     * 但"被压到后台"也可能是别的原因（通知权限框等）。只有真的拉起过确认界面，
+     * 才说明这条路是通的，剩下的是用户在操作 —— 看门狗此时什么都不该做。
+     * 反之（提交后既没广播、也没拉起过确认界面）就是系统没搭理我们，必须兜底。
+     */
+    private boolean installUiLaunched;
+    /**
+     * 系统给的「安装确认界面」Intent（`STATUS_PENDING_USER_ACTION` 里带的）。
+     *
+     * 留着它是为了**回前台重试**：如果广播到的时候我们正被别的系统界面挡着
+     * （最典型的是紧挨着弹出的通知权限框），这次 startActivity 会被
+     * Android 10+ 的「后台启动 Activity」限制**静默丢弃** —— 不报错、界面不出现，
+     * 用户看到的就是「点了下载没反应」。等我们回到前台再拉起一次就好了。
+     */
+    private Intent pendingInstallConfirmation;
     private long lastForegroundCheckAt;
     private boolean notificationChannelReady;
     /** 网页里是否有 video 正在播放 —— 决定要不要给窗口加 FLAG_KEEP_SCREEN_ON。 */
@@ -205,17 +238,24 @@ public class MainActivity extends Activity {
                     ? "系统未返回具体原因" : message.trim();
             if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
                 noteUpdateStep("等待系统安装界面确认");
-                Intent confirmation = intent.getParcelableExtra(Intent.EXTRA_INTENT);
-                if (confirmation != null) {
-                    confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                    startActivity(confirmation);
+                // ★ 刻意**不**解除看门狗：如果下面这次 startActivity 被系统
+                // （Android 10+ 的后台启动限制）静默拦掉，确认界面根本不会出现，
+                // 那就又成了"点完没反应"。看门狗会检查"是否真的成功拉起过"，
+                // 界面起来了话由 installUiLaunched 挡住，不会误触发。
+                pendingInstallConfirmation = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+                if (pendingInstallConfirmation != null) {
+                    launchPendingInstallConfirmation();
+                } else {
+                    noteUpdateStep("系统没有给出安装确认界面，等待看门狗兜底");
                 }
                 return;
             }
+            disarmInstallWatchdog();
             if (status == PackageInstaller.STATUS_SUCCESS) {
                 pendingInstallFile = null;
                 clearUpdateCache();
                 clearPublishedApk();
+                finishPendingInstallMarker();
                 noteUpdateStep("安装成功");
                 Toast.makeText(MainActivity.this, "更新安装完成", Toast.LENGTH_SHORT).show();
                 return;
@@ -255,6 +295,123 @@ public class MainActivity extends Activity {
                     "安装失败：" + detail, Toast.LENGTH_LONG).show();
         }
     };
+
+    /**
+     * 安装会话看门狗（见 {@link #INSTALL_SESSION_WATCHDOG_MS} 的说明）。
+     *
+     * 触发条件：会话已 commit、至今**没收到任何结果广播**、而且**从未成功拉起过
+     * 系统安装确认界面**。三条同时成立 = 系统确实没搭理我们，必须换路。
+     *
+     * 刻意不拿"是否在前台"当判据：被压到后台的原因很多（通知权限框、系统弹窗…），
+     * 用它当判据会在"权限框挡着 + 安装请求被吞"这种组合下漏掉真正的故障；
+     * 而 {@link #installUiLaunched} 是直接证据，不会误判。
+     */
+    private final Runnable installSessionWatchdog = new Runnable() {
+        @Override
+        public void run() {
+            if (!installSessionAwaitingResult || installUiLaunched) {
+                return;
+            }
+            File apk = pendingInstallFile;
+            installSessionAwaitingResult = false;
+            noteUpdateStep("系统 " + (INSTALL_SESSION_WATCHDOG_MS / 1000)
+                    + " 秒内没有任何安装响应，改用系统安装器兜底");
+            if (apk != null && apk.exists()) {
+                Toast.makeText(MainActivity.this,
+                        "系统未响应安装请求，正在改用系统安装器",
+                        Toast.LENGTH_LONG).show();
+                installWithViewer(apk);
+            } else {
+                Toast.makeText(MainActivity.this,
+                        "系统未响应安装请求，请重新检查更新",
+                        Toast.LENGTH_LONG).show();
+            }
+        }
+    };
+
+    /** 安装会话已提交，开始等结果；超时由看门狗兜底。 */
+    private void armInstallWatchdog() {
+        installSessionAwaitingResult = true;
+        installUiLaunched = false;
+        pendingInstallConfirmation = null;
+        mainHandler.removeCallbacks(installSessionWatchdog);
+        mainHandler.postDelayed(installSessionWatchdog, INSTALL_SESSION_WATCHDOG_MS);
+    }
+
+    /** 收到明确的安装结果（成功/失败/取消）后解除看门狗。 */
+    private void disarmInstallWatchdog() {
+        installSessionAwaitingResult = false;
+        installUiLaunched = false;
+        pendingInstallConfirmation = null;
+        mainHandler.removeCallbacks(installSessionWatchdog);
+    }
+
+    /**
+     * 拉起系统安装确认界面。
+     *
+     * 只有"当时我们确实在前台且有窗口焦点"才算真的成功：窗口没有焦点时
+     * （例如通知权限框正压在头上）这次 startActivity 很可能被系统的
+     * 「后台启动 Activity」限制**静默丢弃** —— 不抛异常，但界面不会出现。
+     * 那种情况不置 installUiLaunched，交给 onResume 重试或看门狗兜底。
+     */
+    private void launchPendingInstallConfirmation() {
+        Intent confirmation = pendingInstallConfirmation;
+        if (confirmation == null) {
+            return;
+        }
+        confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(confirmation);
+            if (hasWindowFocus()) {
+                installUiLaunched = true;
+                noteUpdateStep("已拉起系统安装界面");
+            } else {
+                noteUpdateStep("收到安装确认请求时不在前台，"
+                        + "界面可能被系统拦下，回到前台后会重试");
+            }
+        } catch (Exception error) {
+            noteUpdateStep("拉起安装确认界面失败（"
+                    + error.getClass().getSimpleName() + "）：" + updateError(error));
+        }
+    }
+
+    /**
+     * 记下"这一次要装到哪个 versionCode"。
+     *
+     * 走系统安装器（ACTION_VIEW）时我们**拿不到任何回调** —— 装成功了这个进程也已经被替换掉。
+     * 所以只能把目标版本落到 SharedPreferences，等下次启动拿实际版本号对比，
+     * 才能回答"上次那次安装到底成没成"（这也是「关于」页那条记录的价值所在）。
+     */
+    private void markPendingInstall(int versionCode) {
+        if (versionCode <= 0) {
+            return;
+        }
+        preferences().edit().putInt(KEY_PENDING_INSTALL_CODE, versionCode).apply();
+        noteUpdateStep("已记录待安装目标版本 " + versionCode);
+    }
+
+    private void finishPendingInstallMarker() {
+        preferences().edit().remove(KEY_PENDING_INSTALL_CODE).apply();
+    }
+
+    /**
+     * 启动时核对"上次那次安装"的结果。
+     * 上一次若停在"已拉起系统安装器"，这里就能给出结论：换版本了 = 成了；没变 = 没成。
+     */
+    private void reportPreviousInstallAttempt() {
+        int target = preferences().getInt(KEY_PENDING_INSTALL_CODE, 0);
+        if (target <= 0) {
+            return;
+        }
+        int now = currentVersionCode();
+        if (now >= target) {
+            noteUpdateStep("上次安装已完成，当前 " + currentVersionName() + "(" + now + ")");
+        } else {
+            noteUpdateStep("上次安装未完成：仍是 " + currentVersionName() + "(" + now
+                    + ")，目标 " + target + " —— 若已手动装过请忽略");
+        }
+        finishPendingInstallMarker();
+    }
 
     private final class ShellBridge {
         @JavascriptInterface
@@ -335,6 +492,8 @@ public class MainActivity extends Activity {
         // 「解析软件包时出现问题」。属于磁盘 IO，放到后台线程，不占冷启动主线程时间。
         new Thread(() -> removeExpiredApks(new File(getCacheDir(), "updates"),
                 24L * 60L * 60L * 1000L), "juku-cache-cleanup").start();
+        // 核对"上次那次安装"的结果（走系统安装器时没有任何回调，只能这样闭环）
+        reportPreviousInstallAttempt();
         if (savedInstanceState == null || webView.restoreState(savedInstanceState) == null) {
             loadConfiguredServer();
         }
@@ -496,6 +655,11 @@ public class MainActivity extends Activity {
                 pageLoadSettled = true;
                 mainHandler.removeCallbacks(pageLoadWatchdog);
                 installShellBridge();
+                // 通知权限在这里问（页面已就绪的空闲时机），而不是在更新流程中间 ——
+                // 权限框若与"下载完成→拉起安装界面"撞车，安装确认界面会被系统的
+                // 「后台启动 Activity」限制静默丢弃（不报错、界面不出现），
+                // 用户看到的就是"点了下载没反应"。见 requestNotificationPermissionIfNeeded 的说明。
+                requestNotificationPermissionIfNeeded();
                 maybeAutoCheckUpdate();
             }
 
@@ -873,8 +1037,13 @@ public class MainActivity extends Activity {
 
     /**
      * Android 13+ 发通知需要 POST_NOTIFICATIONS 运行时权限。
-     * 没这个权限时 update 下载进度通知会被静默丢弃（notify() 不报错，通知栏却什么都没有），
-     * 所以在真正要发通知之前（开始下载更新包）请求一次。拒绝也不影响下载本身。
+     * 没这个权限时 update 下载进度通知会被静默丢弃（notify() 不报错，通知栏却什么都没有）。
+     *
+     * ★ 调用时机很讲究：**在网页加载完成的空闲时机问一次**（见 onPageFinished），
+     * 绝不能在更新流程中间问 —— 系统权限框会占住前台，而"下载完成 → 拉起系统安装界面"
+     * 恰好发生在同一时刻，那次 startActivity 会被 Android 10+ 的「后台启动 Activity」
+     * 限制静默丢弃：不报错、界面不出现，用户体感就是"点了下载没反应"。
+     * 拒绝也不影响下载本身，只是通知栏看不到进度。
      */
     private void requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT < 33) {
@@ -1041,7 +1210,9 @@ public class MainActivity extends Activity {
         StringBuilder builder = new StringBuilder();
         if (!previous.trim().isEmpty()) {
             String[] lines = previous.trim().split("\n");
-            int from = Math.max(0, lines.length - 9);   // 只留最近 10 行，避免无限增长
+            // 保留最近 15 行：一次完整的更新流程（点击 → 下载 → 预检 → 安装 → 结果）
+            // 就要占十来行，行数留少了会把最关键的开头挤掉。
+            int from = Math.max(0, lines.length - 14);
             for (int index = from; index < lines.length; index++) {
                 builder.append(lines[index]).append('\n');
             }
@@ -1114,7 +1285,10 @@ public class MainActivity extends Activity {
                 .append("版本：").append(currentVersionName())
                 .append("（versionCode ").append(currentVersionCode()).append("）\n")
                 .append("服务器：").append(server).append("\n")
-                .append("设备：").append(describeDevice()).append("\n");
+                .append("设备：").append(describeDevice()).append("\n")
+                // 安装来源放进诊断信息：Android 14+ 的「更新归属」会让非本应用安装的包
+                // 在应用内更新时被系统静默压住，这一行能直接看出是不是这个原因。
+                .append("安装来源：").append(describeInstallSource()).append("\n");
         if (signature != null) {
             text.append("签名：").append(signature).append("\n");
         }
@@ -1160,15 +1334,25 @@ public class MainActivity extends Activity {
 
     /** 把「关于」页的内容整段复制到剪贴板，用户可一键粘贴发出来。 */
     private void copyDiagnostics(String text) {
+        if (copyToClipboard("果果剧库诊断信息", text)) {
+            Toast.makeText(this, "已复制，可直接粘贴发送", Toast.LENGTH_SHORT).show();
+        } else {
+            Toast.makeText(this, "复制失败，请手动选择文本", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /** 写剪贴板。返回是否成功。 */
+    private boolean copyToClipboard(String label, String text) {
         try {
             ClipboardManager manager = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
             if (manager == null) {
-                return;
+                return false;
             }
-            manager.setPrimaryClip(ClipData.newPlainText("果果剧库诊断信息", text));
-            Toast.makeText(this, "已复制，可直接粘贴发送", Toast.LENGTH_SHORT).show();
+            manager.setPrimaryClip(ClipData.newPlainText(label, text));
+            return true;
         } catch (Exception error) {
-            Toast.makeText(this, "复制失败，请手动选择文本", Toast.LENGTH_SHORT).show();
+            Log.w(LOG_TAG, "写剪贴板失败: " + error);
+            return false;
         }
     }
 
@@ -1338,14 +1522,55 @@ public class MainActivity extends Activity {
                 .setTitle("发现手机版更新")
                 .setMessage(message)
                 .setPositiveButton("下载并安装", (dialog, which) -> downloadAndInstall(update))
+                // 兜底出口：应用内安装在某些 ROM 上会被拦得莫名其妙（签名/来源/扫描都会拦），
+                // 浏览器下载是**一定走得通**的那条路（用户手动更新就是这么装的）。
+                // 有这个按钮，用户就不会卡在"点了没反应"上。
+                .setNeutralButton("浏览器下载", (dialog, which) -> openDownloadInBrowser())
                 .setNegativeButton("稍后", null)
                 .show();
     }
 
+    /** 用系统浏览器打开安装包地址 —— 应用内更新完全走不通时的最后一条路。 */
+    private void openDownloadInBrowser() {
+        String url = normalizeServerUrl(
+                preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL))
+                + "api/mobile/apk?name=juku-mobile.apk";
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+            noteUpdateStep("已交给浏览器下载：" + url);
+        } catch (ActivityNotFoundException error) {
+            copyToClipboard("果果剧库下载地址", url);
+            Toast.makeText(this,
+                    "没有可用的浏览器，地址已复制，可粘贴到浏览器里打开",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
     private void downloadAndInstall(MobileUpdate update) {
+        // ★ 入口先落一条记录：能回答"这次点击到底有没有进到下载流程"。
+        // 之前整条链路里最早的记录是"开始下载"，而它前面还有一道
+        // `if (downloadDialog != null) return;` —— 一旦踩中，日志里连一行都不会有，
+        // 现场完全不可解释（用户反馈就是"点了没反应"）。
+        noteUpdateStep("用户点击下载并安装：目标 " + update.versionName
+                + "(" + update.versionCode + ")");
         if (downloadDialog != null) {
+            // 不静默：说清楚为什么没动
+            noteUpdateStep("已有下载在进行中，忽略本次点击");
+            Toast.makeText(this, "更新正在下载中，请稍候", Toast.LENGTH_SHORT).show();
             return;
         }
+        try {
+            startDownload(update);
+        } catch (Exception error) {
+            // 准备阶段（建目录/建对话框）出任何问题都要说出来，不能静默
+            noteUpdateStep("启动下载失败（" + error.getClass().getSimpleName() + "）：" + updateError(error));
+            closeDownloadDialog();
+            Toast.makeText(this,
+                    "无法开始下载：" + updateError(error), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void startDownload(MobileUpdate update) {
         downloadCancelled = false;
         File directory = new File(getCacheDir(), "updates");
         if (!directory.exists() && !directory.mkdirs()) {
@@ -1357,8 +1582,10 @@ public class MainActivity extends Activity {
         removeOtherApks(directory, target);
         // 记下服务端声明的目标版本，安装前拿实物包比对（见 prepareAndInstall）
         pendingUpdateVersionCode = update.versionCode;
-        // 下载要在通知栏显示进度，Android 13+ 需要先拿到通知权限
-        requestNotificationPermissionIfNeeded();
+        // ★ 通知权限**不在这里**请求。
+        // 在这里请求会让系统权限框与"下载完成→拉起安装界面"撞在一起：
+        // 权限框占着前台时，系统的安装确认界面会被「后台启动 Activity」限制静默丢掉，
+        // 症状就是"点了下载没反应"。改为在网页加载完成后的空闲时机请求（见 onPageFinished）。
         noteUpdateStep("开始下载：" + target.getName() + "（目标 " + update.size + " B）");
         downloadCancelled = false;
 
@@ -1385,9 +1612,32 @@ public class MainActivity extends Activity {
                 .setNegativeButton("取消", null)
                 .create();
         downloadDialog.setCanceledOnTouchOutside(false);
+        // ★ 必须监听"被关掉"这件事本身，而不是只给「取消」按钮挂 onClick。
+        //
+        // 之前的写法只在按钮回调里 closeDownloadDialog()，于是**按返回键**（或系统回收、
+        // 用户从最近任务划掉又回来等任何非按钮路径）关掉对话框时，downloadDialog 字段
+        // 一直是非 null，而 downloadAndInstall() 开头有一句
+        //     if (downloadDialog != null) return;
+        // ⇒ 之后**每一次**「下载并安装」都会被这句话静默吞掉，
+        // 用户看到的就是「点了下载新版本后没反应」。这是本次故障最可能的直接原因。
+        downloadDialog.setOnDismissListener(ignored -> {
+            downloadDialog = null;
+            downloadProgress = null;
+            downloadStatus = null;
+            // 对话框都没了，还在后台跑的下载就该停掉：否则用户既看不到进度，
+            // 又会在某个时刻突然被拉去安装（更莫名其妙）。
+            if (!downloadCancelled) {
+                downloadCancelled = true;
+                if (activeUpdateConnection != null) {
+                    activeUpdateConnection.disconnect();
+                }
+            }
+            cancelUpdateNotification();
+        });
         downloadDialog.setOnShowListener(ignored -> downloadDialog
                 .getButton(AlertDialog.BUTTON_NEGATIVE)
                 .setOnClickListener(view -> {
+                    noteUpdateStep("用户取消了下载");
                     downloadCancelled = true;
                     if (activeUpdateConnection != null) {
                         activeUpdateConnection.disconnect();
@@ -1402,35 +1652,47 @@ public class MainActivity extends Activity {
 
     private void downloadUpdate(MobileUpdate update, File target) {
         IOException lastError = null;
-        for (int attempt = 0; attempt <= MAX_DOWNLOAD_RETRY; attempt++) {
-            if (downloadCancelled) {
-                break;
-            }
-            try {
-                boolean ok = downloadUpdateOnce(update, target, attempt);
-                if (ok) {
-                    runOnUiThread(() -> finishDownloadSuccess(target));
-                    return;
-                }
+        try {
+            for (int attempt = 0; attempt <= MAX_DOWNLOAD_RETRY; attempt++) {
                 if (downloadCancelled) {
                     break;
                 }
-                lastError = new IOException("下载未完成");
-            } catch (IOException error) {
-                lastError = error;
-                if (downloadCancelled) {
-                    break;
-                }
-            }
-            // 断点续传：保留已下载部分，重试时带 Range 继续
-            if (attempt < MAX_DOWNLOAD_RETRY) {
-                final int nextAttempt = attempt + 1;
-                runOnUiThread(() -> {
-                    if (downloadStatus != null) {
-                        downloadStatus.setText("网络中断，正在重试（" + nextAttempt + "/" + MAX_DOWNLOAD_RETRY + "）…");
+                try {
+                    boolean ok = downloadUpdateOnce(update, target, attempt);
+                    if (ok) {
+                        runOnUiThread(() -> finishDownloadSuccess(target));
+                        return;
                     }
-                });
+                    if (downloadCancelled) {
+                        break;
+                    }
+                    lastError = new IOException("下载未完成");
+                } catch (IOException error) {
+                    lastError = error;
+                    if (downloadCancelled) {
+                        break;
+                    }
+                }
+                // 断点续传：保留已下载部分，重试时带 Range 继续
+                if (attempt < MAX_DOWNLOAD_RETRY) {
+                    final int nextAttempt = attempt + 1;
+                    runOnUiThread(() -> {
+                        if (downloadStatus != null) {
+                            downloadStatus.setText("网络中断，正在重试（" + nextAttempt + "/" + MAX_DOWNLOAD_RETRY + "）…");
+                        }
+                    });
+                }
             }
+        } catch (Throwable fatal) {
+            // ★ 只 catch IOException 是不够的：非受检异常（NPE / ClassCastException /
+            // IllegalArgumentException 等）会让这个线程**直接死掉**，
+            // 既没有 Toast 也不会关掉对话框 —— 界面就永远停在"正在连接服务器…"，
+            // 用户看到的就是「点了下载没反应」，而且日志里连一行错误都没有。
+            // 这里兜住它，并且明确把它记进更新记录。
+            lastError = new IOException("下载过程中出现异常（"
+                    + fatal.getClass().getSimpleName() + "）：" + updateError(
+                    fatal instanceof Exception ? (Exception) fatal : null));
+            Log.w(LOG_TAG, "下载线程异常", fatal);
         }
         final IOException error = lastError;
         noteUpdateStep("下载失败：" + updateError(error));
@@ -1702,11 +1964,15 @@ public class MainActivity extends Activity {
     }
 
     private void closeDownloadDialog() {
-        if (downloadDialog != null) {
-            downloadDialog.dismiss();
-            downloadDialog = null;
-            downloadProgress = null;
-            downloadStatus = null;
+        AlertDialog dialog = downloadDialog;
+        downloadDialog = null;
+        downloadProgress = null;
+        downloadStatus = null;
+        if (dialog != null) {
+            // 先摘掉 dismiss 监听再关：否则会走一遍"被关掉"分支，把 downloadCancelled
+            // 置真 —— 而下载**成功**后正是在这里关对话框的，那会把一次好结果判成取消。
+            dialog.setOnDismissListener(null);
+            dialog.dismiss();
         }
     }
 
@@ -1820,15 +2086,37 @@ public class MainActivity extends Activity {
             runOnUiThread(() -> showInstallPermissionDialog(apk));
             return;
         }
+        // 记录"这次要装到哪一版" + 当前的安装来源。
+        // 来源很关键：Android 14+ 有「更新归属」限制 —— 若本应用是被别的安装器
+        // （微信/文件管理器/浏览器）装上的，我们自己发起的安装会话有可能被系统压着
+        // 不弹界面也不回报结果。这条信息能一眼看出是不是这个原因。
+        markPendingInstall(expectedCode > 0 ? expectedCode : packageVersionCode(apk));
+        noteUpdateStep("安装来源：" + describeInstallSource());
         try {
             installWithPackageInstaller(apk);
         } catch (Exception error) {
             pendingInstallFile = null;
+            disarmInstallWatchdog();
             // 带上异常类名：PackageInstaller 在部分 ROM 上抛 SecurityException
             // （「不允许安装」），和一般的 IO 异常处理方式不同，日志里必须能区分开。
             noteUpdateStep("会话安装失败（" + error.getClass().getSimpleName() + "）："
                     + updateError(error) + "，改用系统安装器");
             runOnUiThread(() -> installWithViewer(apk));
+        }
+    }
+
+    /** 当前这个包是被谁安装/发起的 —— 排查「更新归属」类拦截时第一时间要看。 */
+    private String describeInstallSource() {
+        PackageManager manager = getPackageManager();
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                InstallSourceInfo info = manager.getInstallSourceInfo(getPackageName());
+                return "安装者=" + String.valueOf(info.getInstallingPackageName())
+                        + "，发起者=" + String.valueOf(info.getInitiatingPackageName());
+            }
+            return "安装者=" + String.valueOf(manager.getInstallerPackageName(getPackageName()));
+        } catch (Exception error) {
+            return "读取失败（" + error.getClass().getSimpleName() + "）";
         }
     }
 
@@ -1948,7 +2236,11 @@ public class MainActivity extends Activity {
                     callback,
                     pendingIntentFlags);
             pendingInstallFile = apk;
+            // 提交之前就把看门狗架起来：commit() 本身也可能一路阻塞不返回，
+            // 那时同样不会有任何界面/回调 —— 这正是"点了没反应"的形态之一。
+            armInstallWatchdog();
             session.commit(pendingIntent.getIntentSender());
+            noteUpdateStep("已提交安装会话（session " + sessionId + "），等待系统响应");
         } finally {
             session.close();
         }
@@ -2046,6 +2338,7 @@ public class MainActivity extends Activity {
     }
 
     private void installWithViewer(File apk) {
+        disarmInstallWatchdog();
         noteUpdateStep("改用系统安装器打开：" + apk.getName() + "（" + apk.length() + " B）");
         // 优先用公共「下载」目录里的副本：私有 cache 里的文件厂商扫描进程读不到
         Uri publicUri = publishApkToDownloads(apk);
@@ -2467,6 +2760,15 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        // 回到前台时补一次「拉起系统安装界面」。
+        // 典型场景：下载完成的那一刻正好弹着通知权限框，系统给的确认界面被
+        // 「后台启动 Activity」限制静默丢弃了 —— 等我们回到前台再拉起一次就好，
+        // 否则用户看到的就是"点了下载，允许完权限，然后什么都没有"。
+        if (installSessionAwaitingResult && !installUiLaunched
+                && pendingInstallConfirmation != null) {
+            noteUpdateStep("回到前台，重试拉起系统安装界面");
+            launchPendingInstallConfirmation();
+        }
         if (webViewPaused) {
             webViewPaused = false;
             webView.resumeTimers();
@@ -2561,6 +2863,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         downloadCancelled = true;
         mainHandler.removeCallbacks(pageLoadWatchdog);
+        disarmInstallWatchdog();
         if (networkCallback != null) {
             try {
                 ((ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE))

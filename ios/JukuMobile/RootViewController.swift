@@ -9,7 +9,7 @@ import WebKit
 /// |-------------------------------------|--------------------------------------------|
 /// | `addJavascriptInterface(JukuShell)`  | `WKScriptMessageHandler("jukuShell")`      |
 /// | `ActionBar` 显隐                     | `setNavigationBarHidden`                   |
-/// | `onShowCustomView` 全屏              | `requestGeometryUpdate(.landscape)`        |
+/// | `onShowCustomView` 全屏              | 由页面自身 CSS 旋转，外壳不旋转系统方向      |
 /// | `DownloadManager`                   | `WKDownload`                               |
 /// | `onShowFileChooser`                 | 无需实现，WKWebView 自动弹系统选择器        |
 final class RootViewController: UIViewController {
@@ -216,27 +216,25 @@ final class RootViewController: UIViewController {
 
     // MARK: - 播放器沉浸模式
 
-    /// 网页通过 `window.JukuShell.setPlayerState(active, hidden)` 上报播放器状态。
-    private func applyPlayerState(active: Bool, controlsHidden: Bool) {
-        let immersive = active && controlsHidden
+    /// 网页通过 `window.JukuShell.setPlayerState(active, hidden, landscape)` 上报播放器状态。
+    ///
+    /// ⚠️ 这里**刻意不做任何系统级旋转**。网页的横竖屏是它自己用 CSS 旋转实现的
+    /// （`player-rotated` class + `--player-rotation`，由页面里的横屏按钮或方向感应驱动，
+    /// 见 `/assets/player-orientation.js`）。外壳一旦插入 `requestGeometryUpdate`，
+    /// 系统旋转会与页面自身的 CSS 旋转叠加，症状是：
+    ///   1. 一进播放器就被强制横屏（用户没点横屏按钮）；
+    ///   2. 页面按自己的尺寸变量算布局，系统旋转后视口尺寸变了，
+    ///      播放区 `stage` 的渲染区域与命中区域错位 → 控件自动隐藏后点屏幕中央呼不出来。
+    ///
+    /// 沉浸条件取「播放中 **且** 已横屏 **且** 控件已隐藏」：
+    /// 竖屏时导航栏常驻，这样即使控件一时没呼出来，用户转回竖屏也能拿到菜单。
+    private func applyPlayerState(active: Bool, controlsHidden: Bool, landscape: Bool) {
+        let immersive = active && landscape && controlsHidden
         guard immersive != immersiveActive else { return }
         immersiveActive = immersive
 
         navigationController?.setNavigationBarHidden(immersive, animated: true)
         setNeedsStatusBarAppearanceUpdate()
-        if immersive {
-            requestLandscape()
-        }
-    }
-
-    private func requestLandscape() {
-        guard #available(iOS 16.0, *) else { return }
-        setNeedsUpdateOfSupportedInterfaceOrientations()
-        guard let scene = view.window?.windowScene else { return }
-        let preferences = UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: .landscape)
-        scene.requestGeometryUpdate(preferences) { _ in
-            // 设备本身竖持且未旋转时可能失败，属预期情况，静默忽略。
-        }
     }
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
@@ -437,7 +435,8 @@ extension RootViewController: WKScriptMessageHandler {
         case "playerState":
             let active = (body["active"] as? NSNumber)?.boolValue ?? false
             let hidden = (body["hidden"] as? NSNumber)?.boolValue ?? false
-            applyPlayerState(active: active, controlsHidden: hidden)
+            let landscape = (body["landscape"] as? NSNumber)?.boolValue ?? false
+            applyPlayerState(active: active, controlsHidden: hidden, landscape: landscape)
         case "ready":
             injectShellBridge()
         default:
@@ -620,17 +619,25 @@ extension RootViewController {
     /// 与 Android 的关键差异：Android 的 `JukuShell` 是原生对象，页面刷新后依然存在；
     /// iOS 侧是注入的 JS 对象，**每次页面加载都要重新赋值**，
     /// 因此「赋值」必须与「安装 observer」分开 —— 后者同一页面只需执行一次。
+    ///
+    /// 状态来源全部取自页面已有的 class，不自造判断：
+    /// - `mobile-player`        → 处于移动端播放器形态
+    /// - `player-controls-hidden` → 页面控件已自动隐藏
+    /// - `player-landscape`     → 页面已切到横屏（这**不是**系统方向，是页面 CSS 旋转的结果）
+    /// 另监听页面在横竖屏切换时派发的 `jukuorientationchange`（见 player-orientation.js），
+    /// 避免仅依赖 class 变化而漏掉状态同步。
     func injectShellBridge() {
         let script = """
         (function(){
           window.JukuShell = window.JukuShell || {};
           window.JukuShell.platform = 'ios';
-          window.JukuShell.setPlayerState = function(active, hidden){
+          window.JukuShell.setPlayerState = function(active, hidden, landscape){
             try {
               window.webkit.messageHandlers.\(JukuConfig.shellHandlerName).postMessage({
                 type: 'playerState',
                 active: !!active,
-                hidden: !!hidden
+                hidden: !!hidden,
+                landscape: !!landscape
               });
             } catch (e) {}
           };
@@ -640,7 +647,8 @@ extension RootViewController {
             var p = document.getElementById('playerPanel');
             var active = !!(p && (p.open === true || p.hasAttribute('open')) && p.classList.contains('mobile-player'));
             var hidden = active && p.classList.contains('player-controls-hidden');
-            window.JukuShell.setPlayerState(active, hidden);
+            var landscape = active && p.classList.contains('player-landscape');
+            window.JukuShell.setPlayerState(active, hidden, landscape);
           };
           var bind = function(){
             var p = document.getElementById('playerPanel');
@@ -648,6 +656,7 @@ extension RootViewController {
             if (p.__jukuShellObserver) { sync(); return; }
             var observer = new MutationObserver(sync);
             observer.observe(p, { attributes: true, attributeFilter: ['class', 'open'] });
+            p.addEventListener('jukuorientationchange', sync);
             p.__jukuShellObserver = observer;
             sync();
           };

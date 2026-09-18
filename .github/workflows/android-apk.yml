@@ -189,10 +189,12 @@ jobs:
           fi
           PUBLISHED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          # 结构对齐服务端 /data/mobile/update.json，apkName 直接用服务端约定名，
+          # 结构对齐服务端 /data/mobile/update.json，apkName/ipaUrl 直接写成服务端约定值，
           # 因此这份文件可以整份替换过去，不需要手工改任何字段。
+          # ipaUrl 供 iOS 端读取（iOS 走服务器自己的 IPA，比 GitHub 快且国内可达）；
+          # Android 端不读这个字段，加了不影响。
           # 用 python 生成以免 notes 里的引号/换行破坏 JSON；单行 -c 规避 YAML 缩进。
-          python3 -c "import json,sys;print(json.dumps({'versionCode':int(sys.argv[1]),'versionName':sys.argv[2],'sha256':sys.argv[3],'size':int(sys.argv[4]),'notes':sys.argv[5],'publishedAt':sys.argv[6],'apkName':'juku-mobile.apk'},ensure_ascii=False,indent=2))" \
+          python3 -c "import json,sys;print(json.dumps({'versionCode':int(sys.argv[1]),'versionName':sys.argv[2],'sha256':sys.argv[3],'size':int(sys.argv[4]),'notes':sys.argv[5],'publishedAt':sys.argv[6],'apkName':'juku-mobile.apk','ipaUrl':'/api/mobile/apk?name=juku-mobile-unsigned.ipa'},ensure_ascii=False,indent=2))" \
             "$VERSION_CODE" "$VERSION_NAME" "$APK_SHA256" "$APK_SIZE" "$NOTES" "$PUBLISHED" \
             > artifacts/update.json
 

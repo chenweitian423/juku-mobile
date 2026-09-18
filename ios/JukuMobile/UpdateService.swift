@@ -101,12 +101,13 @@ enum UpdateService {
         let notes = json["notes"] as? String ?? "本次更新包含功能优化和问题修复。"
         let size = (json["size"] as? NSNumber)?.int64Value ?? 0
 
-        // 下载地址优先级：服务端 ipaUrl > 服务端 apkUrl > GitHub Releases
+        // 下载地址优先级：服务端 `ipaUrl` > GitHub Releases。
+        //
+        // 刻意**不**回退到 `apkUrl` —— iOS 装不了 APK，给用户一个 APK 链接毫无意义。
+        // `ipaUrl` 由发布流程写入服务端 update.json，指向服务端自己的 IPA
+        // （同目录下与 APK 一起发布，走服务器比 GitHub 快且在国内可达）。
         let downloadURL: URL
         if let ipa = json["ipaUrl"] as? String, let resolved = URL(string: ipa, relativeTo: baseURL) {
-            downloadURL = resolved
-        } else if let apk = json["apkUrl"] as? String,
-                  let resolved = URL(string: apk, relativeTo: baseURL) {
             downloadURL = resolved
         } else if let resolved = URL(string: JukuConfig.releasesURL) {
             downloadURL = resolved

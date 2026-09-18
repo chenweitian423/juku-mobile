@@ -195,10 +195,12 @@ final class RootViewController: UIViewController {
         // iOS 15 起 WKWebsiteDataStore 也有 removeData(ofTypes:modifiedSince:) 的
         // async 重载，不写 completionHandler 会被解析成 async 调用，
         // 在非 async 函数里直接报 "'async' call in a function that does not support concurrency"。
+        // 且该参数在新 SDK 里是非可选的 @MainActor @Sendable 闭包，传 nil 会报类型不兼容，
+        // 所以给一个空闭包。
         WKWebsiteDataStore.default().removeData(
             ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
             modifiedSince: .distantPast,
-            completionHandler: nil
+            completionHandler: {}
         )
         store.webCacheVersion = JukuConfig.currentVersionCode
     }

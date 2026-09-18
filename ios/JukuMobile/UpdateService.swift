@@ -106,16 +106,24 @@ enum UpdateService {
         return list
     }
 
+    /// 命中结果：更新信息 + 是哪个源给的（**由调用方落盘**）。
+    ///
+    /// 刻意不在这里写 `ServerStore`：它是 `struct`，而这里的入参是 `let` 常量，
+    /// 直接赋值编译不过（`cannot assign to property: 'store' is a 'let' constant`）。
+    /// 让 UpdateService 保持无状态、由持有者落盘，语义也更清楚。
+    struct FetchResult {
+        let update: MobileUpdate
+        /// 命中的更新源 key（"custom" / "server" / "github"）。
+        let sourceKey: String
+    }
+
     /// 依次尝试各更新源，第一个成功的即采用。
-    static func fetch(store: ServerStore) async throws -> MobileUpdate {
-        let candidates = sources(store: store)
+    static func fetch(store: ServerStore) async throws -> FetchResult {
         var lastError: Error = UpdateCheckError.malformed("没有可用的更新源")
-        for source in candidates {
+        for source in sources(store: store) {
             do {
                 let update = try await fetch(source: source)
-                store.lastGoodUpdateSource = source.key
-                store.lastAPKURL = update.downloadURL.absoluteString
-                return update
+                return FetchResult(update: update, sourceKey: source.key)
             } catch {
                 lastError = error
             }
@@ -218,18 +226,5 @@ enum UpdateService {
     /// 当前安装版本是否落后于服务端。
     static func isNewer(_ update: MobileUpdate) -> Bool {
         update.versionCode > JukuConfig.currentVersionCode
-    }
-
-    /// 按服务端约定拼出 IPA 下载地址：与 APK 共用 `api/mobile/apk`，只换 `name` 参数。
-    ///
-    /// 用相对 base 拼接（与 Android 端 `new URL(new URL(server), "api/mobile/apk")` 一致），
-    /// 这样服务器挂在反向代理子路径下也能工作。
-    static func remoteIPAURL(base: URL) -> URL? {
-        guard let endpoint = URL(string: JukuConfig.apkAPIPath, relativeTo: base),
-              var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
-            return nil
-        }
-        components.queryItems = [URLQueryItem(name: "name", value: JukuConfig.ipaRemoteName)]
-        return components.url
     }
 }

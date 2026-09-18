@@ -380,8 +380,7 @@ final class RootViewController: UIViewController {
         if !store.lastAPKURL.isEmpty {
             return store.lastAPKURL
         }
-        return JukuConfig.githubLatestDownload
-            .replacingOccurrences(of: "/releases/latest/download/", with: "/releases/latest")
+        return JukuConfig.releasesURL
     }
 
     /// 重启客户端。
@@ -579,10 +578,14 @@ final class RootViewController: UIViewController {
         updateTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let update = try await UpdateService.fetch(store: self.store)
+                let result = try await UpdateService.fetch(store: self.store)
+                let update = result.update
                 await MainActor.run {
                     self.updateCheckRunning = false
                     self.store.lastUpdateCheck = Date()
+                    // 记住命中的源与直链（「关于」页与「浏览器下载」用）
+                    self.store.lastGoodUpdateSource = result.sourceKey
+                    self.store.lastAPKURL = update.downloadURL.absoluteString
                     if !UpdateService.isNewer(update) {
                         if userInitiated {
                             self.presentToast("已经是最新版本 \(update.versionName)")

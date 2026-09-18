@@ -132,6 +132,10 @@ public class MainActivity extends Activity {
     private static final String GITHUB_LATEST_DOWNLOAD =
             "https://github.com/chenweitian423/juku-mobile/releases/latest/download/";
 
+    /** 浏览器直接打开用的版本列表页（没有已知直链时的兜底）。 */
+    private static final String GITHUB_RELEASES_PAGE =
+            "https://github.com/chenweitian423/juku-mobile/releases/latest";
+
     /** 查更新信息用的超时（源可能有好几个，单个源别等太久）。 */
     private static final int UPDATE_CONNECT_TIMEOUT_MS = 8000;
     private static final int UPDATE_READ_TIMEOUT_MS = 12000;
@@ -1769,7 +1773,7 @@ public class MainActivity extends Activity {
         if (!cached.isEmpty()) {
             return cached;
         }
-        return GITHUB_LATEST_DOWNLOAD.replace("/releases/latest/download/", "/releases/latest");
+        return GITHUB_RELEASES_PAGE;
     }
 
     /** 用系统浏览器打开安装包地址 —— 应用内更新完全走不通时的最后一条路。 */

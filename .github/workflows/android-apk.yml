@@ -93,7 +93,11 @@ jobs:
           JUKU_KEYSTORE_PASSWORD: ${{ secrets.JUKU_KEYSTORE_PASSWORD }}
           JUKU_KEY_ALIAS: ${{ secrets.JUKU_KEY_ALIAS }}
           JUKU_KEY_PASSWORD: ${{ secrets.JUKU_KEY_PASSWORD }}
-        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+        run: |
+          # 防御：在 Windows 上提交时 gradlew 容易丢失可执行位，
+          # Linux 检出后直接执行会以 126 (Permission denied) 失败。
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
       - name: Collect and verify APK
         id: apk

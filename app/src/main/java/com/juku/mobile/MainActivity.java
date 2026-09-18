@@ -1,5 +1,6 @@
 package com.juku.mobile;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -20,7 +21,8 @@ import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;import android.os.Build;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -85,14 +87,20 @@ public class MainActivity extends Activity {
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.10";
-    private static final int CURRENT_VERSION_CODE = 19;
+    private static final String CURRENT_VERSION_NAME = "1.3.11";
+    private static final int CURRENT_VERSION_CODE = 20;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
+    private static final int NOTIFICATION_PERMISSION_REQUEST = 1003;
     private static final long AUTO_UPDATE_INTERVAL_MS = 12L * 60L * 60L * 1000L;
     private static final long MIN_FOREGROUND_RECHECK_MS = 30L * 60L * 1000L;
 
-    private static final String NOTIFICATION_CHANNEL_ID = "juku_update";    private static final int NOTIFICATION_ID_UPDATE = 0x4A55; // "JU"
+    /** 整页加载看门狗：超过这个时间且进度还几乎没动，就判定卡住并给出可点击的重试页。 */
+    private static final long PAGE_LOAD_WATCHDOG_MS = 25_000L;
+    private static final int PAGE_LOAD_WATCHDOG_MAX_ROUNDS = 2;
+
+    private static final String NOTIFICATION_CHANNEL_ID = "juku_update";
+    private static final int NOTIFICATION_ID_UPDATE = 0x4A55; // "JU"
     private static final int MAX_DOWNLOAD_RETRY = 2;
 
     private FrameLayout contentRoot;
@@ -116,8 +124,36 @@ public class MainActivity extends Activity {
     private volatile boolean downloadCancelled;
     private long lastForegroundCheckAt;
     private boolean notificationChannelReady;
+    /** 网页里是否有 video 正在播放 —— 决定要不要给窗口加 FLAG_KEEP_SCREEN_ON。 */
+    private boolean playbackActive;
+    private boolean webViewPaused;
+    private boolean pageLoadSettled = true;
+    private int pageLoadWatchdogRounds;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    /**
+     * 整页加载超时看门狗。
+     *
+     * 服务器不可达时 WebView 可能长时间停在「白屏 + 进度条 0%」，用户既没提示也无从下手
+     * （onReceivedError 只在连接明确失败时触发，TCP 挂起不会）。这里在设定时限后检查进度，
+     * 若几乎没有推进就切到可点击重试的错误页。
+     */
+    private final Runnable pageLoadWatchdog = new Runnable() {
+        @Override
+        public void run() {
+            if (pageLoadSettled || showingError || isFinishing() || webView == null) {
+                return;
+            }
+            if (progressBar.getProgress() >= 20 && pageLoadWatchdogRounds < PAGE_LOAD_WATCHDOG_MAX_ROUNDS) {
+                // 已经有实质进展，只是慢 —— 再给一轮，不要打扰用户
+                pageLoadWatchdogRounds++;
+                mainHandler.postDelayed(this, PAGE_LOAD_WATCHDOG_MS);
+                return;
+            }
+            showError("页面加载超时\n\n服务器响应太慢或网络不稳定，请检查网络后重试。\n点此重新加载");
+        }
+    };
 
     private final BroadcastReceiver installResultReceiver = new BroadcastReceiver() {
         @Override
@@ -196,6 +232,15 @@ public class MainActivity extends Activity {
                 }
             });
         }
+
+        /**
+         * 网页上报是否有 video 正在播放。
+         * 播放期间给窗口加 FLAG_KEEP_SCREEN_ON，避免看到一半屏幕自动息屏。
+         */
+        @JavascriptInterface
+        public void setPlaybackState(boolean playing) {
+            runOnUiThread(() -> applyPlaybackState(playing));
+        }
     }
 
     /** 处理网页里注入条目的动作。 */
@@ -209,6 +254,9 @@ public class MainActivity extends Activity {
                 break;
             case "update":
                 checkForUpdate(true);
+                break;
+            case "clearcache":
+                clearWebCacheAndReload();
                 break;
             case "about":
                 showAboutDialog();
@@ -227,8 +275,10 @@ public class MainActivity extends Activity {
         registerInstallReceiver();
         configureWebView();
         // 启动时清掉更新缓存里的历史安装包：既避免旧包被误安装（见 finishDownloadSuccess），
-        // 也避免这些几十 KB 的残留长期占着缓存。
-        removeOtherApks(new File(getCacheDir(), "updates"), null);
+        // 也避免这些几十 KB 的残留长期占着缓存。属于磁盘 IO，放到后台线程做，
+        // 不占冷启动的主线程时间。
+        new Thread(() -> removeOtherApks(new File(getCacheDir(), "updates"), null),
+                "juku-cache-cleanup").start();
         if (savedInstanceState == null || webView.restoreState(savedInstanceState) == null) {
             loadConfiguredServer();
         }
@@ -344,7 +394,9 @@ public class MainActivity extends Activity {
         settings.setUseWideViewPort(true);
         settings.setBuiltInZoomControls(false);
         settings.setDisplayZoomControls(false);
-        settings.setAllowFileAccess(true);
+        // 只加载 http(s) 页面，file:// 访问没有任何用处，关掉能少一条攻击面。
+        // content:// 仍要保持开启 —— 文件选择器（onShowFileChooser）拿到的就是 content URI。
+        settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(true);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
@@ -368,11 +420,18 @@ public class MainActivity extends Activity {
                 showingError = false;
                 errorView.setVisibility(View.GONE);
                 progressBar.setVisibility(View.VISIBLE);
+                // 每次整页加载重新起表，避免上一轮的计时误伤这一轮
+                pageLoadSettled = false;
+                pageLoadWatchdogRounds = 0;
+                mainHandler.removeCallbacks(pageLoadWatchdog);
+                mainHandler.postDelayed(pageLoadWatchdog, PAGE_LOAD_WATCHDOG_MS);
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
+                pageLoadSettled = true;
+                mainHandler.removeCallbacks(pageLoadWatchdog);
                 installShellBridge();
                 maybeAutoCheckUpdate();
             }
@@ -532,7 +591,7 @@ public class MainActivity extends Activity {
                 + "label.className='small';"
                 + "label.textContent='客户端';"
                 + "if(anchor){panel.insertBefore(label,anchor);}else{panel.appendChild(label);}"
-                + "var items=[['server','服务器地址'],['update','检查更新'],['about','关于']];"
+                + "var items=[['server','服务器地址'],['update','检查更新'],['clearcache','清除网页缓存'],['about','关于']];"
                 + "for(var i=0;i<items.length;i++){"
                 + "var key=items[i][0],text=items[i][1];"
                 + "var b=document.createElement('button');"
@@ -583,6 +642,30 @@ public class MainActivity extends Activity {
                 + "+'.mobile-player video::-webkit-media-controls-panel{display:none !important;}';"
                 + "(document.head||document.documentElement).appendChild(shellStyle);"
                 + "}}catch(e){}"
+                // 播放状态上报：播放期间外壳给窗口加 FLAG_KEEP_SCREEN_ON，
+                // 否则看剧时长时间不触摸屏幕会自动息屏。
+                // 用 document 上的捕获监听（媒体事件不冒泡，捕获能收到），
+                // 这样页面重建 video 元素也不用重新绑定。
+                + "if(!window.__jukuPlaybackWatch){"
+                + "window.__jukuPlaybackWatch=true;"
+                + "var lastPlay=null;"
+                + "window.__jukuReportPlayback=function(){"
+                + "var playing=false;"
+                + "try{"
+                + "var vs=document.querySelectorAll('video');"
+                + "for(var i=0;i<vs.length;i++){var v=vs[i];"
+                + "if(v&&!v.paused&&!v.ended&&!v.seeking&&v.readyState>2){playing=true;break;}}"
+                + "}catch(e){}"
+                + "if(playing!==lastPlay){lastPlay=playing;"
+                + "try{JukuShell.setPlaybackState(playing);}catch(e){}"
+                + "try{console.log('[juku] playback='+playing);}catch(e){}}"
+                + "};"
+                + "var onPlaybackEvent=function(){window.__jukuReportPlayback();};"
+                + "var evts=['playing','play','pause','ended','emptied','waiting','seeked'];"
+                + "for(var i=0;i<evts.length;i++){"
+                + "document.addEventListener(evts[i],onPlaybackEvent,true);}"
+                + "window.__jukuReportPlayback();"
+                + "}"
                 + "if(window.__jukuShellBridgeInstalled){return;}"
                 + "window.__jukuShellBridgeInstalled=true;"
                 + "var sync=function(){"
@@ -658,12 +741,73 @@ public class MainActivity extends Activity {
         applyImmersiveMode(playerActive && controlsHidden);
     }
 
+    /**
+     * 播放中保持屏幕常亮。
+     *
+     * 只在状态真的变化时动窗口标志 —— 网页里 video 的 play/pause 事件很密集，
+     * 每次都 addFlags 会让窗口频繁请求布局。
+     */
+    private void applyPlaybackState(boolean playing) {
+        if (playbackActive == playing) {
+            return;
+        }
+        playbackActive = playing;
+        if (playing && !isFinishing()) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+    }
+
+    /**
+     * 清除网页缓存并重新加载。
+     *
+     * 网页改版后残留旧资源、或页面状态错乱时的一键自救入口
+     * （相当于浏览器里的「强制刷新」）。刻意**不动 Cookie**，否则会把登录态一起清掉。
+     */
+    private void clearWebCacheAndReload() {
+        if (webView == null) {
+            return;
+        }
+        try {
+            webView.clearCache(true);
+        } catch (Exception ignored) {
+            // 清缓存失败不该阻塞重载
+        }
+        preferences().edit().putInt(KEY_WEB_CACHE_VERSION, CURRENT_VERSION_CODE).apply();
+        showingError = false;
+        errorView.setVisibility(View.GONE);
+        Toast.makeText(this, "已清除网页缓存，正在重新加载", Toast.LENGTH_SHORT).show();
+        if (webView.getUrl() == null) {
+            loadConfiguredServer();
+        } else {
+            webView.reload();
+        }
+    }
+
+    /**
+     * Android 13+ 发通知需要 POST_NOTIFICATIONS 运行时权限。
+     * 没这个权限时 update 下载进度通知会被静默丢弃（notify() 不报错，通知栏却什么都没有），
+     * 所以在真正要发通知之前（开始下载更新包）请求一次。拒绝也不影响下载本身。
+     */
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < 33) {
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                NOTIFICATION_PERMISSION_REQUEST);
+    }
+
     /** 外壳菜单。正常情况走网页「更多」面板里的注入条目，这里只服务兜底悬浮按钮。 */
     private void showShellMenu() {
         if (isFinishing()) {
             return;
         }
-        String[] items = {"服务器地址", "刷新", "检查更新", "回到首页", "关于"};
+        String[] items = {"服务器地址", "刷新", "清除网页缓存", "检查更新", "回到首页", "关于"};
         new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                 .setTitle(R.string.app_name)
                 .setItems(items, (dialog, which) -> {
@@ -677,13 +821,16 @@ public class MainActivity extends Activity {
                             webView.reload();
                             break;
                         case 2:
-                            checkForUpdate(true);
+                            clearWebCacheAndReload();
                             break;
                         case 3:
+                            checkForUpdate(true);
+                            break;
+                        case 4:
                             String address = preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL);
                             webView.loadUrl(normalizeServerUrl(address));
                             break;
-                        case 4:
+                        case 5:
                             showAboutDialog();
                             break;
                         default:
@@ -1025,6 +1172,8 @@ public class MainActivity extends Activity {
         final File target = new File(directory, "juku-mobile-" + update.versionCode + ".apk");
         // 先把历史残留包清掉，避免旧包被误当成新包安装
         removeOtherApks(directory, target);
+        // 下载要在通知栏显示进度，Android 13+ 需要先拿到通知权限
+        requestNotificationPermissionIfNeeded();
         noteUpdateStep("开始下载：" + target.getName() + "（目标 " + update.size + " B）");
         downloadCancelled = false;
 
@@ -1796,11 +1945,26 @@ public class MainActivity extends Activity {
 
     @SuppressLint("SetJavaScriptEnabled")
     private void rebuildWebView() {
+        boolean wasPaused = webViewPaused;
         webView = new WebView(this);
         contentRoot.addView(webView, 0, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
+        // 新 WebView 是「活的」，先把上一实例遗留的「屏幕常亮」状态复位。
+        playbackActive = false;
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         configureWebView();
+        // 重建前若正处于暂停（后台），要重新施加暂停：
+        // pauseTimers() 是进程级的，和实例状态必须保持一致，否则会出现
+        // 「以为是活的、实际定时器已停」这类难查的卡死。
+        if (wasPaused) {
+            webViewPaused = true;
+            webView.onPause();
+            webView.pauseTimers();
+        } else {
+            webViewPaused = false;
+            webView.resumeTimers();
+        }
     }
 
     private SharedPreferences preferences() {
@@ -1830,7 +1994,49 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (webViewPaused) {
+            webViewPaused = false;
+            webView.resumeTimers();
+            webView.onResume();
+        }
+        // 回到前台时让网页重报一次播放状态：
+        // 后台期间视频被暂停，而「播放中」的事件不会因为恢复而发生，得主动问一次，
+        // 否则回到前台继续播放后屏幕会按原来的判断息屏。
+        if (webView != null) {
+            webView.evaluateJavascript(
+                    "try{window.__jukuReportPlayback&&window.__jukuReportPlayback();}catch(e){}", null);
+        }
         maybeCheckUpdateOnForeground();
+    }
+
+    /**
+     * 切到后台时暂停 WebView。
+     *
+     * 不加这段的话，App 退到后台后页面的 JS 定时器（注入脚本里那个 1.5s 的菜单巡检）、
+     * CSS 动画、轮询请求都会照常跑，白白耗电耗流量；视频也会在后台继续解码。
+     * 恢复时成对调用 resumeTimers()/onResume()，否则 WebView 会一直卡在暂停态。
+     */
+    @Override
+    protected void onPause() {
+        if (webView != null && !webViewPaused) {
+            webViewPaused = true;
+            webView.onPause();
+            webView.pauseTimers();
+        }
+        // 后台不该继续占着「屏幕常亮」的标记
+        applyPlaybackState(false);
+        super.onPause();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == NOTIFICATION_PERMISSION_REQUEST) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            // 拒绝只是看不到通知栏进度，下载与安装照常进行
+            noteUpdateStep(granted ? "已获得通知权限" : "未授予通知权限（通知栏看不到下载进度）");
+        }
     }
 
     @Override
@@ -1881,6 +2087,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         downloadCancelled = true;
+        mainHandler.removeCallbacks(pageLoadWatchdog);
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (activeUpdateConnection != null) {
             activeUpdateConnection.disconnect();
             activeUpdateConnection = null;

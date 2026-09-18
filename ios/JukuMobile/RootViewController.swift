@@ -33,6 +33,8 @@ final class RootViewController: UIViewController {
     private var didReportMainFrameError = false
     private var immersiveActive = false
     private var toastAlert: UIAlertController?
+    /// 网页里是否有 video 正在播放 —— 决定要不要禁用息屏。
+    private var playbackActive = false
     private var webViewTopSafeConstraint: NSLayoutConstraint?
     private var webViewTopFullConstraint: NSLayoutConstraint?
     /// 兜底菜单入口：默认隐藏，只在注入网页头部失败时显示。
@@ -56,6 +58,12 @@ final class RootViewController: UIViewController {
             self,
             selector: #selector(applicationDidBecomeActive),
             name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationWillResignActive),
+            name: UIApplication.willResignActiveNotification,
             object: nil
         )
 
@@ -296,18 +304,48 @@ final class RootViewController: UIViewController {
         )
     }
 
-    /// 处理网页「更多」面板里注入条目的动作（server / update / about）。
+    /// 处理网页「更多」面板里注入条目的动作（server / update / clearcache / about）。
     private func handleNativeAction(_ action: String) {
         switch action {
         case "server":
             presentServerDialog()
         case "update":
             checkForUpdate(userInitiated: true)
+        case "clearcache":
+            clearWebCacheAndReload()
         case "about":
             presentAbout()
         default:
             break
         }
+    }
+
+    /// 清除网页缓存并重新加载（浏览器里的「强制刷新」）。
+    ///
+    /// 只清 URL 缓存与 WebStorage 里的版本标记，**不动 Cookie** —— 否则会把登录态一起清掉。
+    private func clearWebCacheAndReload() {
+        let store = WKWebsiteDataStore.default()
+        let types = WKWebsiteDataStore.allWebsiteDataTypes().subtracting([
+            WKWebsiteDataTypeCookies,
+            WKWebsiteDataTypeLocalStorage
+        ])
+        store.removeData(ofTypes: types, modifiedSince: .distantPast) { [weak self] in
+            DispatchQueue.main.async {
+                self?.presentToast("已清除网页缓存，正在重新加载")
+                if let self, self.webView.url == nil {
+                    self.loadConfiguredServer()
+                } else {
+                    self?.webView.reload()
+                }
+            }
+        }
+    }
+
+    /// 播放中禁止息屏。状态没变时不动，避免频繁改 UIApplication 状态。
+    private func applyPlaybackState(_ playing: Bool) {
+        guard playbackActive != playing else { return }
+        playbackActive = playing
+        UIApplication.shared.isIdleTimerDisabled = playing
     }
 
     /// 外壳菜单。正常走网页「更多」面板里的注入条目，这里只服务兜底悬浮按钮。
@@ -318,6 +356,9 @@ final class RootViewController: UIViewController {
         })
         sheet.addAction(UIAlertAction(title: "刷新", style: .default) { [weak self] _ in
             self?.webView.reload()
+        })
+        sheet.addAction(UIAlertAction(title: "清除网页缓存", style: .default) { [weak self] _ in
+            self?.clearWebCacheAndReload()
         })
         sheet.addAction(UIAlertAction(title: "检查更新", style: .default) { [weak self] _ in
             self?.checkForUpdate(userInitiated: true)
@@ -393,8 +434,20 @@ final class RootViewController: UIViewController {
     // MARK: - 更新
 
     @objc private func applicationDidBecomeActive() {
+        // 回到前台时让网页重报一次播放状态：后台期间视频被暂停，
+        // 「播放中」的事件不会因为恢复而发生，得主动问一次，
+        // 否则继续播放后屏幕会按旧判断息屏。
+        webView.evaluateJavaScript(
+            "window.__jukuReportPlayback && window.__jukuReportPlayback()",
+            completionHandler: nil
+        )
         guard store.shouldCheckUpdate(interval: JukuConfig.minForegroundRecheck) else { return }
         checkForUpdate(userInitiated: false)
+    }
+
+    /// 退到后台时解除息屏锁 —— 后台不该继续持有这个全局状态。
+    @objc private func applicationWillResignActive() {
+        applyPlaybackState(false)
     }
 
     /// 页面加载完成后按 12 小时节流自动检查（对应 Android `maybeAutoCheckUpdate`）。
@@ -511,6 +564,9 @@ extension RootViewController: WKScriptMessageHandler {
             // floating：网页没有可用入口（未登录时头部动作区被隐藏，或网页改版），显示兜底按钮。
             let mode = body["mode"] as? String ?? "floating"
             fallbackMenuButton?.isHidden = (mode == "inpage")
+        case "playback":
+            // 播放中禁止息屏，否则看剧时长时间不触摸会自动黑屏。
+            applyPlaybackState((body["playing"] as? NSNumber)?.boolValue ?? false)
         case "ready":
             injectShellBridge()
         default:
@@ -731,6 +787,42 @@ extension RootViewController {
               });
             } catch (e) {}
           };
+          window.JukuShell.setPlaybackState = function(playing){
+            try {
+              window.webkit.messageHandlers.\(JukuConfig.shellHandlerName).postMessage({
+                type: 'playback',
+                playing: !!playing
+              });
+            } catch (e) {}
+          };
+          // 播放状态上报：播放期间禁止息屏（isIdleTimerDisabled）。
+          // 用 document 上的捕获监听（媒体事件不冒泡，捕获能收到），
+          // 这样页面重建 video 元素也不用重新绑定。
+          if (!window.__jukuPlaybackWatch) {
+            window.__jukuPlaybackWatch = true;
+            var jukuLastPlay = null;
+            window.__jukuReportPlayback = function(){
+              var playing = false;
+              try {
+                var vs = document.querySelectorAll('video');
+                for (var i = 0; i < vs.length; i++) {
+                  var v = vs[i];
+                  if (v && !v.paused && !v.ended && !v.seeking && v.readyState > 2) { playing = true; break; }
+                }
+              } catch (e) {}
+              if (playing !== jukuLastPlay) {
+                jukuLastPlay = playing;
+                window.JukuShell.setPlaybackState(playing);
+                try { console.log('[juku] playback=' + playing); } catch (e) {}
+              }
+            };
+            var jukuOnPlaybackEvent = function(){ window.__jukuReportPlayback(); };
+            var jukuPlaybackEvents = ['playing','play','pause','ended','emptied','waiting','seeked'];
+            for (var i = 0; i < jukuPlaybackEvents.length; i++) {
+              document.addEventListener(jukuPlaybackEvents[i], jukuOnPlaybackEvent, true);
+            }
+            window.__jukuReportPlayback();
+          }
           // 菜单条目注入：直接挂进网页自己的「更多」面板（#morePanel），
           // 不再额外加一个 header 按钮 —— 那样会出现两个「⋯」。
           // 这段必须放在 __jukuShellBridgeInstalled 短路之前 —— SPA 会重建头部 DOM，
@@ -744,7 +836,7 @@ extension RootViewController {
             label.className = 'small';
             label.textContent = '客户端';
             if (anchor) { panel.insertBefore(label, anchor); } else { panel.appendChild(label); }
-            var items = [['server', '服务器地址'], ['update', '检查更新'], ['about', '关于']];
+            var items = [['server', '服务器地址'], ['update', '检查更新'], ['clearcache', '清除网页缓存'], ['about', '关于']];
             for (var i = 0; i < items.length; i++) {
               var key = items[i][0], text = items[i][1];
               var btn = document.createElement('button');

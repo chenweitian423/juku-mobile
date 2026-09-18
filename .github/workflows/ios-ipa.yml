@@ -1,0 +1,166 @@
+name: Build iOS IPA (unsigned)
+
+# 只保留手动触发。
+# macOS runner 按 Linux 的 10 倍消耗免费额度，不适合挂在 push 上。
+# 需要出 IPA 时到 Actions 页面点 "Run workflow"。
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 构建成功后把 IPA 附到对应版本 Release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Verify version parity with Android
+        run: |
+          set -euo pipefail
+          ANDROID_VERSION=$(sed -n 's/.*versionName "\(.*\)".*/\1/p' app/build.gradle | head -n1)
+          ANDROID_CODE=$(sed -n 's/.*versionCode \([0-9]\+\).*/\1/p' app/build.gradle | head -n1)
+          IOS_VERSION=$(sed -n 's/^ *MARKETING_VERSION: *"\(.*\)".*/\1/p' ios/project.yml | head -n1)
+          IOS_CODE=$(sed -n 's/^ *CURRENT_PROJECT_VERSION: *"\(.*\)".*/\1/p' ios/project.yml | head -n1)
+
+          echo "Android: $ANDROID_VERSION ($ANDROID_CODE)"
+          echo "iOS    : $IOS_VERSION ($IOS_CODE)"
+
+          if [ "$ANDROID_VERSION" != "$IOS_VERSION" ] || [ "$ANDROID_CODE" != "$IOS_CODE" ]; then
+            echo "::error::两端版本号不一致，请同步 app/build.gradle 与 ios/project.yml"
+            exit 1
+          fi
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild -list -project JukuMobile.xcodeproj
+
+      - name: Build unsigned app
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project JukuMobile.xcodeproj \
+            -scheme JukuMobile \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build
+
+      - name: Package unsigned IPA
+        id: ipa
+        working-directory: ios
+        run: |
+          set -euo pipefail
+
+          APP=$(find build/Build/Products -maxdepth 2 -name 'JukuMobile.app' -type d | head -n1)
+          if [ -z "$APP" ]; then
+            echo "::error::没有找到构建出的 .app"
+            find build/Build/Products -maxdepth 3 -type d | head -30
+            exit 1
+          fi
+
+          PLIST="$APP/Info.plist"
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST")
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST")
+          DISPLAY_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST")
+
+          echo "App        : $DISPLAY_NAME"
+          echo "Bundle ID  : $BUNDLE_ID"
+          echo "Version    : $VERSION ($BUILD)"
+
+          if [ "$BUNDLE_ID" != "com.juku.mobile" ]; then
+            echo "::error::Bundle ID 不符合预期: $BUNDLE_ID"
+            exit 1
+          fi
+
+          # 未签名 IPA：Payload/<AppName>.app 直接 zip
+          mkdir -p Payload
+          cp -R "$APP" "Payload/JukuMobile.app"
+          rm -rf Payload/JukuMobile.app/_CodeSignature
+
+          mkdir -p artifacts
+          IPA="artifacts/juku-mobile-${VERSION}-unsigned.ipa"
+          zip -qry "$IPA" Payload
+
+          SIZE=$(wc -c < "$IPA" | tr -d ' ')
+          SHA=$(shasum -a 256 "$IPA" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### iOS IPA 构建成功（未签名）"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 文件 | \`juku-mobile-${VERSION}-unsigned.ipa\` |"
+            echo "| Bundle ID | \`$BUNDLE_ID\` |"
+            echo "| 版本 | \`$VERSION (build $BUILD)\` |"
+            echo "| 大小 | \`$SIZE\` bytes |"
+            echo "| sha256 | \`$SHA\` |"
+            echo ""
+            echo "> 未签名 IPA 无法直接安装，需用 AltStore / Sideloadly / TrollStore 等工具自签后再装入设备。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: juku-mobile-${{ steps.ipa.outputs.version }}-ios-unsigned-${{ github.run_number }}
+          path: ios/artifacts/*.ipa
+          retention-days: 30
+
+      - name: Attach IPA to release
+        if: inputs.create_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_NAME: ${{ steps.ipa.outputs.version }}
+          IPA_SHA256: ${{ steps.ipa.outputs.sha256 }}
+          IPA_SIZE: ${{ steps.ipa.outputs.size }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION_NAME}"
+          IPA="ios/artifacts/juku-mobile-${VERSION_NAME}-unsigned.ipa"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$IPA" --clobber
+          else
+            printf '%s\n' \
+              "iOS 客户端 **${VERSION_NAME}**（未签名 IPA）。" \
+              "" \
+              "| 项 | 值 |" \
+              "|---|---|" \
+              "| 文件 | \`juku-mobile-${VERSION_NAME}-unsigned.ipa\` |" \
+              "| 大小 | \`${IPA_SIZE}\` bytes |" \
+              "| sha256 | \`${IPA_SHA256}\` |" \
+              "" \
+              "> 未签名 IPA 需用 AltStore / Sideloadly / TrollStore 等工具自签后安装。" \
+              > "$RUNNER_TEMP/ios-notes.md"
+            gh release create "$TAG" "$IPA" \
+              --title "果果剧库 ${VERSION_NAME}" \
+              --notes-file "$RUNNER_TEMP/ios-notes.md"
+          fi

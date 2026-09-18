@@ -1,0 +1,40 @@
+# 行尾统一由这里决定，不依赖各人本机的 core.autocrlf 设置。
+#
+# 关键：gradlew / *.sh 在 Linux CI 上执行，若被写成 CRLF 会直接报
+#   bash: ./gradlew: /bin/sh^M: bad interpreter
+# 因此强制 LF；Windows 专用批处理反而需要 CRLF。
+
+* text=auto eol=lf
+
+# Windows 批处理与 PowerShell 需要 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制文件不做行尾转换
+*.jar binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.apk binary
+*.aab binary
+*.ipa binary
+*.jks binary
+*.keystore binary
+*.p12 binary
+gradle/wrapper/gradle-wrapper.jar binary
+
+# 文本资源
+*.java text
+*.swift text
+*.gradle text
+*.xml text
+*.json text
+*.yml text
+*.yaml text
+*.md text
+*.pro text
+
+# 生成物：iOS 工程文件由 XcodeGen 产出，diff 无意义
+ios/*.xcodeproj/** linguist-generated=true

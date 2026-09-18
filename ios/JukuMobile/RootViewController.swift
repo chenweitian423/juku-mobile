@@ -33,6 +33,8 @@ final class RootViewController: UIViewController {
     private var didReportMainFrameError = false
     private var immersiveActive = false
     private var toastAlert: UIAlertController?
+    private var webViewTopSafeConstraint: NSLayoutConstraint?
+    private var webViewTopFullConstraint: NSLayoutConstraint?
     /// 兜底菜单入口：默认隐藏，只在注入网页头部失败时显示。
     private var fallbackMenuButton: UIButton?
 
@@ -107,9 +109,28 @@ final class RootViewController: UIViewController {
         NSLayoutConstraint.activate([
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
+        // 顶部约束二选一：常态贴安全区（内容不被刘海/状态栏遮挡），
+        // 播放器沉浸时改成贴屏幕顶（真正铺满，见 applyPlayerState）。
+        webViewTopSafeConstraint = webView.topAnchor.constraint(
+            equalTo: view.safeAreaLayoutGuide.topAnchor
+        )
+        webViewTopFullConstraint = webView.topAnchor.constraint(equalTo: view.topAnchor)
+        webViewTopSafeConstraint?.isActive = true
+
+        // 点击兜底：iOS 上视频层会吃掉命中测试，网页的 stage 收不到 pointer 事件，
+        // 表现就是播放器控件自动隐藏后，点屏幕中间呼不出来。
+        // 这里挂一个「不取消触摸」的点击手势（cancelsTouchesInView = false，
+        // 不影响网页自己的任何手势），把判断交给网页里的 __jukuTapWatch：
+        // 它只会在「控件确实处于隐藏状态且页面没响应」时补一次合成的快速点击。
+        let playerTapFallback = UITapGestureRecognizer(
+            target: self,
+            action: #selector(handlePlayerTapFallback)
+        )
+        playerTapFallback.cancelsTouchesInView = false
+        playerTapFallback.requiresExclusiveTouchType = false
+        webView.addGestureRecognizer(playerTapFallback)
 
         progressObservation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
             let progress = Float(webView.estimatedProgress)
@@ -243,6 +264,11 @@ final class RootViewController: UIViewController {
         immersiveActive = immersive
         // 导航栏本来就是常驻隐藏的（见 configureNavigationItem），这里只切换状态栏
         setNeedsStatusBarAppearanceUpdate()
+        // 沉浸时让 WebView 铺到屏幕最上沿：否则在刘海机型上安全区仍有 47~59pt，
+        // 播放器顶部会留一条黑边、而且那条区域点不动。
+        // 网页侧会用 env(safe-area-inset-top) 自己避让刘海（WebView 覆盖到刘海后该值为真实值）。
+        webViewTopSafeConstraint?.isActive = !immersive
+        webViewTopFullConstraint?.isActive = immersive
     }
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
@@ -259,6 +285,15 @@ final class RootViewController: UIViewController {
 
     @objc private func fallbackMenuTapped() {
         presentShellMenu()
+    }
+
+    /// 点击兜底：交给网页里的 __jukuTapWatch 判断是否需要补一次点击。
+    /// 页面正常（控件已经呼出 / 不在播放器里）时它什么都不做，所以不会重复触发。
+    @objc private func handlePlayerTapFallback() {
+        webView.evaluateJavaScript(
+            "window.__jukuTapWatch && window.__jukuTapWatch(0, 0)",
+            completionHandler: nil
+        )
     }
 
     /// 处理网页「更多」面板里注入条目的动作（server / update / about）。
@@ -411,7 +446,7 @@ final class RootViewController: UIViewController {
 
         \(update.notes)
 
-        iOS 需要下载 IPA 后用 AltStore / Sideloadly 等工具自签安装。
+        iOS 需要下载 IPA 后用你自己的签名工具导入安装（AltStore / Sideloadly / TrollStore 等）。
         """
         let alert = UIAlertController(title: "发现手机版更新", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "去下载", style: .default) { _ in
@@ -761,6 +796,20 @@ extension RootViewController {
               }
             }
           } catch (e) {}
+          // 只在网页自己的移动播放器模式下生效：把 WebKit 的原生媒体控件彻底藏掉。
+          // 那一层会盖在 video 上吃掉命中测试 —— 网页的 stage 收不到点击，
+          // 于是「控件隐藏后点屏幕中间呼不出来」。网页本来就用自己的一套控件
+          // （update() 里会 video.controls = !mode.matches），这里只是兜住漏网情况。
+          try {
+            if (!document.getElementById('juku-shell-style')) {
+              var shellStyle = document.createElement('style');
+              shellStyle.id = 'juku-shell-style';
+              shellStyle.textContent = '.mobile-player video::-webkit-media-controls,' +
+                '.mobile-player video::-webkit-media-controls-enclosure,' +
+                '.mobile-player video::-webkit-media-controls-panel{display:none !important;}';
+              (document.head || document.documentElement).appendChild(shellStyle);
+            }
+          } catch (e) {}
           if (window.__jukuShellBridgeInstalled) { return; }
           window.__jukuShellBridgeInstalled = true;
           var sync = function(){
@@ -781,6 +830,66 @@ extension RootViewController {
             sync();
           };
           bind();
+
+          // ------------------------------------------------------------------
+          // 点击呼出播放器控件的兜底
+          //
+          // 网页自己的逻辑：stage 上 pointerdown/pointerup 成对，且要求
+          // 「位移 ≤ 12px 且耗时 ≤ 320ms」，否则直接丢弃。两个已知失效场景：
+          //   1) iOS 上视频层会吃掉命中测试，stage 的 pointer 事件收不到；
+          //   2) 手指按住稍久（> 320ms）就被当成手势丢掉。
+          // 这里做一层看门狗：确认「控件确实是隐藏状态、且页面在 200ms 内没有
+          // 自己呼出来」时，才补一次合成的快速点击。页面正常工作时不会重复触发。
+          // ------------------------------------------------------------------
+          window.__jukuTapWatch = function(x, y){
+            var p = document.getElementById('playerPanel');
+            if (!p || !(p.open === true || p.hasAttribute('open'))) { return; }
+            if (!p.classList.contains('player-controls-hidden')) { return; }
+            var now = Date.now();
+            if (now - (window.__jukuTapAt || 0) < 450) { return; }
+            window.__jukuTapAt = now;
+            setTimeout(function(){
+              var panel = document.getElementById('playerPanel');
+              if (!panel || !panel.classList.contains('player-controls-hidden')) { return; }
+              var stage = panel.querySelector('.playback-stage');
+              if (!stage) { return; }
+              var fire = function(type, buttons){
+                var event;
+                try {
+                  event = new PointerEvent(type, {
+                    bubbles: true, cancelable: true, composed: true,
+                    pointerId: 1, pointerType: 'touch', isPrimary: true,
+                    button: 0, buttons: buttons, clientX: x || 0, clientY: y || 0
+                  });
+                } catch (e) {
+                  event = new Event(type, { bubbles: true, cancelable: true });
+                  event.pointerId = 1; event.isPrimary = true;
+                  event.button = 0; event.clientX = x || 0; event.clientY = y || 0;
+                }
+                stage.dispatchEvent(event);
+              };
+              fire('pointerdown', 1);
+              fire('pointerup', 0);
+              try { console.log('[juku] player tap fallback'); } catch (e) {}
+            }, 200);
+          };
+          var jukuTouchStart = null;
+          document.addEventListener('touchstart', function(e){
+            var t = e.changedTouches && e.changedTouches[0];
+            jukuTouchStart = t ? { x: t.clientX, y: t.clientY, time: Date.now() } : null;
+          }, true);
+          document.addEventListener('touchend', function(e){
+            var t = e.changedTouches && e.changedTouches[0];
+            var start = jukuTouchStart;
+            jukuTouchStart = null;
+            if (!t || !start) { return; }
+            var el = e.target;
+            if (el && el.closest && el.closest('button,input,select,a,label')) { return; }
+            // 滑动（切集/快进）和长按不算点击
+            if (Math.hypot(t.clientX - start.x, t.clientY - start.y) > 12) { return; }
+            if (Date.now() - start.time > 900) { return; }
+            window.__jukuTapWatch(t.clientX, t.clientY);
+          }, true);
         })();
         """
         webView.evaluateJavaScript(script, completionHandler: nil)

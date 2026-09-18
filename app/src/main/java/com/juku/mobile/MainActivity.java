@@ -82,8 +82,8 @@ public class MainActivity extends Activity {
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.7";
-    private static final int CURRENT_VERSION_CODE = 16;
+    private static final String CURRENT_VERSION_NAME = "1.3.8";
+    private static final int CURRENT_VERSION_CODE = 17;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final long AUTO_UPDATE_INTERVAL_MS = 12L * 60L * 60L * 1000L;
@@ -562,6 +562,18 @@ public class MainActivity extends Activity {
                 + "var cb=document.getElementById('mobileAutoRotate');"
                 + "if(cb&&cb.checked){cb.checked=false;cb.dispatchEvent(new Event('change',{bubbles:true}));}"
                 + "}}catch(e){}"
+                // 只在网页自己的移动播放器模式下生效：把原生媒体控件层彻底藏掉。
+                // 那一层会盖在 video 上吃掉命中测试（iOS 上尤其明显），
+                // 网页本来就用自己的一套控件，这里只是兜住漏网情况。
+                + "try{"
+                + "if(!document.getElementById('juku-shell-style')){"
+                + "var shellStyle=document.createElement('style');"
+                + "shellStyle.id='juku-shell-style';"
+                + "shellStyle.textContent='.mobile-player video::-webkit-media-controls,'"
+                + "+'.mobile-player video::-webkit-media-controls-enclosure,'"
+                + "+'.mobile-player video::-webkit-media-controls-panel{display:none !important;}';"
+                + "(document.head||document.documentElement).appendChild(shellStyle);"
+                + "}}catch(e){}"
                 + "if(window.__jukuShellBridgeInstalled){return;}"
                 + "window.__jukuShellBridgeInstalled=true;"
                 + "var sync=function(){"
@@ -580,6 +592,48 @@ public class MainActivity extends Activity {
                 + "sync();"
                 + "};"
                 + "bind();"
+                // 点击呼出播放器控件的兜底。
+                // 网页自己的逻辑是 stage 上 pointerdown/pointerup 成对，且要求
+                // 「位移 ≤ 12px 且耗时 ≤ 320ms」，超时就当手势丢掉 —— 手指按住稍久
+                // 就会出现「控件隐藏后点屏幕中间呼不出来」。这里做看门狗：
+                // 只在「控件确实是隐藏状态、且页面 200ms 内没有自己呼出来」时补一次
+                // 合成的快速点击；页面正常工作时不会重复触发。
+                + "window.__jukuTapWatch=function(x,y){"
+                + "var p=document.getElementById('playerPanel');"
+                + "if(!p||!(p.open===true||p.hasAttribute('open'))){return;}"
+                + "if(!p.classList.contains('player-controls-hidden')){return;}"
+                + "var now=Date.now();"
+                + "if(now-(window.__jukuTapAt||0)<450){return;}"
+                + "window.__jukuTapAt=now;"
+                + "setTimeout(function(){"
+                + "var panel=document.getElementById('playerPanel');"
+                + "if(!panel||!panel.classList.contains('player-controls-hidden')){return;}"
+                + "var stage=panel.querySelector('.playback-stage');"
+                + "if(!stage){return;}"
+                + "var fire=function(type,buttons){"
+                + "var ev;"
+                + "try{ev=new PointerEvent(type,{bubbles:true,cancelable:true,composed:true,"
+                + "pointerId:1,pointerType:'touch',isPrimary:true,button:0,buttons:buttons,"
+                + "clientX:x||0,clientY:y||0});}"
+                + "catch(e){ev=new Event(type,{bubbles:true,cancelable:true});"
+                + "ev.pointerId=1;ev.isPrimary=true;ev.button=0;ev.clientX=x||0;ev.clientY=y||0;}"
+                + "stage.dispatchEvent(ev);};"
+                + "fire('pointerdown',1);fire('pointerup',0);"
+                + "try{console.log('[juku] player tap fallback');}catch(e){}"
+                + "},200);};"
+                + "var jukuTouchStart=null;"
+                + "document.addEventListener('touchstart',function(e){"
+                + "var t=e.changedTouches&&e.changedTouches[0];"
+                + "jukuTouchStart=t?{x:t.clientX,y:t.clientY,time:Date.now()}:null;},true);"
+                + "document.addEventListener('touchend',function(e){"
+                + "var t=e.changedTouches&&e.changedTouches[0];"
+                + "var start=jukuTouchStart;jukuTouchStart=null;"
+                + "if(!t||!start){return;}"
+                + "var el=e.target;"
+                + "if(el&&el.closest&&el.closest('button,input,select,a,label')){return;}"
+                + "if(Math.hypot(t.clientX-start.x,t.clientY-start.y)>12){return;}"
+                + "if(Date.now()-start.time>900){return;}"
+                + "window.__jukuTapWatch(t.clientX,t.clientY);},true);"
                 + "})()";
         webView.evaluateJavascript(script, null);
     }

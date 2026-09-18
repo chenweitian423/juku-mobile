@@ -96,8 +96,19 @@ public class MainActivity extends Activity {
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.14";
-    private static final int CURRENT_VERSION_CODE = 23;
+    /**
+     * 版本号的**唯一事实来源是 `app/build.gradle`**（versionName / versionCode），
+     * 运行时从 PackageManager 读，这里不再硬编码一份。
+     *
+     * 之前的写法是「gradle 一份 + 本文件一份」，改版本时漏改一处不会报错，
+     * 但会静默带偏三处逻辑：网页缓存清理判据（KEY_WEB_CACHE_VERSION）、
+     * 更新比较（服务端 versionCode 与本地的比较）、UA 上报 —— 排查起来毫无线索。
+     * 下面两个兜底值只在 PackageManager 抛异常（理论上不会）时使用。
+     */
+    private static final String FALLBACK_VERSION_NAME = "0.0.0";
+    private static final int FALLBACK_VERSION_CODE = 1;
+    private String resolvedVersionName;
+    private int resolvedVersionCode;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1003;
@@ -126,6 +137,13 @@ public class MainActivity extends Activity {
     private TextView downloadStatus;
     private HttpURLConnection activeUpdateConnection;
     private volatile File pendingInstallFile;
+    /**
+     * 本次要安装的更新包在**服务端声明的** versionCode。
+     * 安装前会拿实物包的 versionCode 跟它比对 —— 服务端历史上出现过「APK 与 update.json
+     * 不是同批发布」的情况（APK 的 sha256 每次构建都变，抄写必然对不上），
+     * 比对不上就明确中止安装，而不是把错的包装进去。
+     */
+    private volatile int pendingUpdateVersionCode;
     /** 另存到公共「下载」目录的那份安装包（装成功后清掉，失败则留作手动安装的兜底）。 */
     private Uri publishedApkUri;
     private boolean showingError;
@@ -183,6 +201,8 @@ public class MainActivity extends Activity {
             int status = intent.getIntExtra(
                     PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
             String message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+            String detail = message == null || message.trim().isEmpty()
+                    ? "系统未返回具体原因" : message.trim();
             if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
                 noteUpdateStep("等待系统安装界面确认");
                 Intent confirmation = intent.getParcelableExtra(Intent.EXTRA_INTENT);
@@ -200,8 +220,15 @@ public class MainActivity extends Activity {
                 Toast.makeText(MainActivity.this, "更新安装完成", Toast.LENGTH_SHORT).show();
                 return;
             }
-            String detail = message == null || message.trim().isEmpty()
-                    ? "系统未返回具体原因" : message.trim();
+            // ★ 用户主动放弃 / 被设备策略挡下：这是**预期结果，不是故障**。
+            // 必须在这里就停下，绝不能走下面的「改用系统安装器」降级路径 ——
+            // 否则用户刚点完「取消」，安装界面立刻又弹一次，体感像卡死循环。
+            if (isUserAbortedStatus(status)) {
+                pendingInstallFile = null;
+                noteUpdateStep("安装未完成（用户取消或被策略阻止，status=" + status + "）");
+                Toast.makeText(MainActivity.this, "已取消安装", Toast.LENGTH_SHORT).show();
+                return;
+            }
             noteUpdateStep("安装失败（" + status + "）：" + detail);
             File failedApk = pendingInstallFile;
             pendingInstallFile = null;
@@ -280,6 +307,9 @@ public class MainActivity extends Activity {
                 break;
             case "clearcache":
                 clearWebCacheAndReload();
+                break;
+            case "restart":
+                restartClient();
                 break;
             case "about":
                 showAboutDialog();
@@ -364,7 +394,14 @@ public class MainActivity extends Activity {
         errorView.setOnClickListener(view -> {
             showingError = false;
             errorView.setVisibility(View.GONE);
-            webView.reload();
+            // ★ reload() 在「从没成功加载过任何页面」时是空操作：WebView 没有可重载的 URL，
+            // 点了毫无反应（真实用户场景：首次启动服务器不可达 → 错误页 → 网络恢复 →
+            // 用户点屏幕却没动静）。这里补一条回落：没有 URL 就直接重新加载配置的服务器。
+            if (webView.getUrl() == null && webView.getOriginalUrl() == null) {
+                loadConfiguredServer();
+            } else {
+                webView.reload();
+            }
         });
         errorView.setVisibility(View.GONE);
         contentRoot.addView(errorView, new FrameLayout.LayoutParams(
@@ -426,7 +463,7 @@ public class MainActivity extends Activity {
         settings.setAllowContentAccess(true);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
-        settings.setUserAgentString(settings.getUserAgentString() + " JukuMobile/" + CURRENT_VERSION_NAME);
+        settings.setUserAgentString(settings.getUserAgentString() + " JukuMobile/" + currentVersionName());
         clearWebCacheAfterUpgrade();
         webView.addJavascriptInterface(new ShellBridge(), "JukuShell");
 
@@ -519,7 +556,28 @@ public class MainActivity extends Activity {
                 filePathCallback = callback;
                 Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
                 intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType("*/*");
+                // 按页面 <input accept="…"> 声明的类型过滤。
+                // 原来的写法固定 "*/*"，选图片也得从「最近文件」里翻；
+                // 只有一个具体类型时直接 setType，多个类型走 EXTRA_MIME_TYPES。
+                String[] acceptTypes = params.getAcceptTypes();
+                if (acceptTypes != null && acceptTypes.length > 0) {
+                    java.util.List<String> mimeTypes = new java.util.ArrayList<>();
+                    for (String type : acceptTypes) {
+                        if (type != null && type.contains("/")) {
+                            mimeTypes.add(type);
+                        }
+                    }
+                    if (mimeTypes.size() == 1) {
+                        intent.setType(mimeTypes.get(0));
+                    } else if (mimeTypes.size() > 1) {
+                        intent.setType("*/*");
+                        intent.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes.toArray(new String[0]));
+                    } else {
+                        intent.setType("*/*");
+                    }
+                } else {
+                    intent.setType("*/*");
+                }
                 intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
                 try {
                     startActivityForResult(Intent.createChooser(intent, "选择文件"), FILE_CHOOSER_REQUEST);
@@ -619,7 +677,7 @@ public class MainActivity extends Activity {
                 + "label.className='small';"
                 + "label.textContent='客户端';"
                 + "if(anchor){panel.insertBefore(label,anchor);}else{panel.appendChild(label);}"
-                + "var items=[['server','服务器地址'],['update','检查更新'],['clearcache','清除网页缓存'],['about','关于']];"
+                + "var items=[['server','服务器地址'],['update','检查更新'],['clearcache','清除网页缓存'],['restart','重启客户端'],['about','关于']];"
                 + "for(var i=0;i<items.length;i++){"
                 + "var key=items[i][0],text=items[i][1];"
                 + "var b=document.createElement('button');"
@@ -802,7 +860,7 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {
             // 清缓存失败不该阻塞重载
         }
-        preferences().edit().putInt(KEY_WEB_CACHE_VERSION, CURRENT_VERSION_CODE).apply();
+        preferences().edit().putInt(KEY_WEB_CACHE_VERSION, currentVersionCode()).apply();
         showingError = false;
         errorView.setVisibility(View.GONE);
         Toast.makeText(this, "已清除网页缓存，正在重新加载", Toast.LENGTH_SHORT).show();
@@ -843,7 +901,7 @@ public class MainActivity extends Activity {
         if (isFinishing()) {
             return;
         }
-        String[] items = {"服务器地址", "刷新", "清除网页缓存", "检查更新", "回到首页", "关于"};
+        String[] items = {"服务器地址", "刷新", "重启客户端", "清除网页缓存", "检查更新", "回到首页", "关于"};
         new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                 .setTitle(R.string.app_name)
                 .setItems(items, (dialog, which) -> {
@@ -854,19 +912,26 @@ public class MainActivity extends Activity {
                         case 1:
                             showingError = false;
                             errorView.setVisibility(View.GONE);
-                            webView.reload();
+                            if (webView.getUrl() == null && webView.getOriginalUrl() == null) {
+                                loadConfiguredServer();
+                            } else {
+                                webView.reload();
+                            }
                             break;
                         case 2:
-                            clearWebCacheAndReload();
+                            restartClient();
                             break;
                         case 3:
-                            checkForUpdate(true);
+                            clearWebCacheAndReload();
                             break;
                         case 4:
+                            checkForUpdate(true);
+                            break;
+                        case 5:
                             String address = preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL);
                             webView.loadUrl(normalizeServerUrl(address));
                             break;
-                        case 5:
+                        case 6:
                             showAboutDialog();
                             break;
                         default:
@@ -874,6 +939,42 @@ public class MainActivity extends Activity {
                     }
                 })
                 .show();
+    }
+
+    /**
+     * 重启客户端（重建 WebView + 回到首页）。
+     *
+     * 用途：网页前端进入异常状态时（SPA 路由错乱、注入脚本状态卡死、沉浸标志残留），
+     * 单纯「刷新页面」往往救不回来，用户的实际做法是去最近任务里划掉再打开。
+     * 这里给一个应用内入口，把这类操作收敛成一次点击。
+     *
+     * 刻意**不杀进程**：`AlarmManager` 定时的「真·冷启动」要依赖精确闹钟权限，
+     * 拿不到权限时闹钟会被系统推迟，症状是「点了重启，应用反而消失了」。
+     * 重建 WebView（并复位沉浸/常亮/错误页等外壳状态）已经能覆盖全部已知的卡死场景，
+     * 而且行为完全可预期。
+     */
+    private void restartClient() {
+        noteUpdateStep("用户触发重启客户端（重建 WebView）");
+        try {
+            applyImmersiveMode(false);
+            applyPlaybackState(false);
+            if (webView != null) {
+                contentRoot.removeView(webView);
+                webView.stopLoading();
+                webView.setWebChromeClient(null);
+                webView.setWebViewClient(new WebViewClient());
+                webView.destroy();
+                webView = null;
+            }
+        } catch (Exception error) {
+            Log.w(LOG_TAG, "重启客户端时销毁旧 WebView 失败: " + error);
+        }
+        showingError = false;
+        errorView.setVisibility(View.GONE);
+        progressBar.setVisibility(View.VISIBLE);
+        rebuildWebView();
+        loadConfiguredServer();
+        Toast.makeText(this, "已重启客户端", Toast.LENGTH_SHORT).show();
     }
 
     private boolean isLegacyInternalServer(String address) {
@@ -888,11 +989,11 @@ public class MainActivity extends Activity {
 
     private void clearWebCacheAfterUpgrade() {
         int cachedVersion = preferences().getInt(KEY_WEB_CACHE_VERSION, 0);
-        if (cachedVersion >= CURRENT_VERSION_CODE) {
+        if (cachedVersion >= currentVersionCode()) {
             return;
         }
         webView.clearCache(true);
-        preferences().edit().putInt(KEY_WEB_CACHE_VERSION, CURRENT_VERSION_CODE).apply();
+        preferences().edit().putInt(KEY_WEB_CACHE_VERSION, currentVersionCode()).apply();
     }
 
     /** 清理更新缓存目录中的历史安装包，避免长期占用存储。 */
@@ -940,7 +1041,7 @@ public class MainActivity extends Activity {
         StringBuilder builder = new StringBuilder();
         if (!previous.trim().isEmpty()) {
             String[] lines = previous.trim().split("\n");
-            int from = Math.max(0, lines.length - 6);   // 只留最近 7 行，避免无限增长
+            int from = Math.max(0, lines.length - 9);   // 只留最近 10 行，避免无限增长
             for (int index = from; index < lines.length; index++) {
                 builder.append(lines[index]).append('\n');
             }
@@ -1010,8 +1111,8 @@ public class MainActivity extends Activity {
         String downloadUrl = server + "api/mobile/apk?name=juku-mobile.apk";
         StringBuilder text = new StringBuilder()
                 .append("应用：果果剧库 手机版\n")
-                .append("版本：").append(CURRENT_VERSION_NAME)
-                .append("（versionCode ").append(CURRENT_VERSION_CODE).append("）\n")
+                .append("版本：").append(currentVersionName())
+                .append("（versionCode ").append(currentVersionCode()).append("）\n")
                 .append("服务器：").append(server).append("\n")
                 .append("设备：").append(describeDevice()).append("\n");
         if (signature != null) {
@@ -1019,7 +1120,8 @@ public class MainActivity extends Activity {
         }
         text.append("\n点击“检查更新”可立即获取最新版本。")
                 .append("\n若自动更新装不上，可复制下面这行到浏览器下载安装：\n")
-                .append(downloadUrl);
+                .append(downloadUrl)
+                .append("\n\n页面卡住不动时，可在“⋯ → 重启客户端”里重建界面。");
 
         // 最近更新记录：手机端出问题时用户直接把这一页截图即可（不必抓 logcat）
         String trace = preferences().getString(KEY_UPDATE_TRACE, "").trim();
@@ -1147,12 +1249,12 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 MobileUpdate update = fetchMobileUpdate();
-                noteUpdateStep("检查更新：本地 " + CURRENT_VERSION_NAME + "(" + CURRENT_VERSION_CODE
+                noteUpdateStep("检查更新：本地 " + currentVersionName() + "(" + currentVersionCode()
                         + ") → 服务器 " + update.versionName + "(" + update.versionCode + ")");
                 runOnUiThread(() -> {
                     updateCheckRunning = false;
                     preferences().edit().putLong(KEY_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply();
-                    if (update.versionCode <= CURRENT_VERSION_CODE) {
+                    if (update.versionCode <= currentVersionCode()) {
                         if (userInitiated) {
                             Toast.makeText(MainActivity.this, "已经是最新版本 " + update.versionName, Toast.LENGTH_SHORT).show();
                         }
@@ -1180,7 +1282,7 @@ public class MainActivity extends Activity {
         connection.setReadTimeout(15000);
         connection.setUseCaches(false);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("User-Agent", "JukuMobile/" + CURRENT_VERSION_NAME);
+        connection.setRequestProperty("User-Agent", "JukuMobile/" + currentVersionName());
         try {
             int status = connection.getResponseCode();
             InputStream stream = status >= 200 && status < 300
@@ -1229,7 +1331,7 @@ public class MainActivity extends Activity {
         String size = update.size > 0
                 ? String.format(Locale.CHINA, "%.2f MB", update.size / 1024.0 / 1024.0)
                 : "大小未知";
-        String message = "当前版本：" + CURRENT_VERSION_NAME + "\n"
+        String message = "当前版本：" + currentVersionName() + "\n"
                 + "最新版本：" + update.versionName + "（" + size + "）\n\n"
                 + update.notes;
         new AlertDialog.Builder(this, R.style.JukuDialogTheme)
@@ -1253,6 +1355,8 @@ public class MainActivity extends Activity {
         final File target = new File(directory, "juku-mobile-" + update.versionCode + ".apk");
         // 先把历史残留包清掉，避免旧包被误当成新包安装
         removeOtherApks(directory, target);
+        // 记下服务端声明的目标版本，安装前拿实物包比对（见 prepareAndInstall）
+        pendingUpdateVersionCode = update.versionCode;
         // 下载要在通知栏显示进度，Android 13+ 需要先拿到通知权限
         requestNotificationPermissionIfNeeded();
         noteUpdateStep("开始下载：" + target.getName() + "（目标 " + update.size + " B）");
@@ -1360,7 +1464,7 @@ public class MainActivity extends Activity {
         connection.setConnectTimeout(15000);
         connection.setReadTimeout(60000);
         connection.setUseCaches(false);
-        connection.setRequestProperty("User-Agent", "JukuMobile/" + CURRENT_VERSION_NAME);
+        connection.setRequestProperty("User-Agent", "JukuMobile/" + currentVersionName());
         if (resuming) {
             connection.setRequestProperty("Range", "bytes=" + existing + "-");
         }
@@ -1690,7 +1794,22 @@ public class MainActivity extends Activity {
             });
             return;
         }
-        // 预检 2：签名是否与已安装版本一致 —— 不一致时系统必然拒绝，提前给出指引
+        // 预检 2：实物包的 versionCode 必须等于服务端 version.json 声明的值。
+        // 服务端历史上踩过的坑是「APK 与 update.json 不是同批发布」（APK 的 sha256
+        // 每次构建都变，手工抄必然对不上）。sha256 校验能拦住大部分情况，但若服务端
+        // 那份 update.json 的 sha256 为空就会漏过去，于是把不匹配的包装进手机。
+        // 这里做最后一道闸：宁可中止，也不装一个来路不明的版本。
+        int expectedCode = pendingUpdateVersionCode;
+        if (expectedCode > 0) {
+            int actualCode = packageVersionCode(apk);
+            noteUpdateStep("更新包 versionCode=" + actualCode + "（服务端声明 " + expectedCode + "）");
+            if (actualCode > 0 && actualCode != expectedCode) {
+                noteUpdateStep("版本不一致，已中止安装（防止装上错配的包）");
+                runOnUiThread(() -> showVersionMismatchGuide(actualCode, expectedCode));
+                return;
+            }
+        }
+        // 预检 3：签名是否与已安装版本一致 —— 不一致时系统必然拒绝，提前给出指引
         if (hasSignatureConflict(apk)) {
             noteUpdateStep("签名与已安装版本不一致");
             runOnUiThread(() -> showSignatureConflictGuide(apk));
@@ -2000,6 +2119,27 @@ public class MainActivity extends Activity {
         return null;
     }
 
+    /**
+     * 更新包实物版本与服务端版本信息对不上时的说明。
+     *
+     * 这种情况几乎只有一个成因：服务端只替换了 APK 与 update.json 中的一份
+     * （两份文件不是同批发布）。装上会造成版本号混乱、甚至功能异常，所以宁可中止。
+     */
+    private void showVersionMismatchGuide(int actualCode, int expectedCode) {
+        if (isFinishing()) {
+            return;
+        }
+        new AlertDialog.Builder(this, R.style.JukuDialogTheme)
+                .setTitle("更新包与版本信息不一致")
+                .setMessage("服务器上这份安装包的实际版本号是 " + actualCode
+                        + "，但版本信息里写的是 " + expectedCode + "。\n\n"
+                        + "通常是因为服务端这次只换了其中一份文件（安装包与 update.json "
+                        + "不是同批发布的）。为了不装上错误的版本，已中止安装。\n\n"
+                        + "可以稍后重试；若一直如此，请让服务器管理员重新发布一次。")
+                .setPositiveButton("知道了", null)
+                .show();
+    }
+
     /** 签名冲突时给出明确、可执行的指引（而不是一句“安装失败”）。 */
     private void showSignatureConflictGuide(File apk) {
         String signature = describeSignature();
@@ -2052,6 +2192,19 @@ public class MainActivity extends Activity {
                 || detail.contains("签名")
                 || detail.contains("不兼容")
                 || lower.contains("inconsistent");
+    }
+
+    /**
+     * 安装结果是否属于「用户主动放弃 / 被设备策略拦下」。
+     *
+     * `STATUS_FAILURE_ABORTED(3)`  = 用户在系统安装界面上点了取消（或安装会话被主动放弃）
+     * `STATUS_FAILURE_BLOCKED(4)`  = 被设备策略 / 家长控制 / 未知来源限制挡下
+     *
+     * 这两类都不是「包有问题」，不该触发降级重试：用户不想装，就别再弹一次安装器。
+     */
+    private boolean isUserAbortedStatus(int status) {
+        return status == PackageInstaller.STATUS_FAILURE_ABORTED
+                || status == PackageInstaller.STATUS_FAILURE_BLOCKED;
     }
 
     private void registerInstallReceiver() {
@@ -2112,7 +2265,12 @@ public class MainActivity extends Activity {
                     Toast.makeText(MainActivity.this, "网络已恢复，正在重新加载", Toast.LENGTH_SHORT).show();
                     showingError = false;
                     errorView.setVisibility(View.GONE);
-                    webView.reload();
+                    // 同 errorView 的点击重试：首次加载就失败时 WebView 没有 URL，reload() 是空操作
+                    if (webView.getUrl() == null && webView.getOriginalUrl() == null) {
+                        loadConfiguredServer();
+                    } else {
+                        webView.reload();
+                    }
                 });
             }
         };
@@ -2234,6 +2392,56 @@ public class MainActivity extends Activity {
 
     private SharedPreferences preferences() {
         return getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
+    /**
+     * 读取本机实际安装的版本号（与 `app/build.gradle` 天然一致，不需要在两处维护）。
+     * 结果缓存一次；进程被杀后重装新版本再启动自然会重新读到新值。
+     */
+    private synchronized void resolveVersion() {
+        if (resolvedVersionName != null && resolvedVersionCode > 0) {
+            return;
+        }
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            int code = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                    ? (int) info.getLongVersionCode()
+                    : info.versionCode;
+            resolvedVersionCode = code > 0 ? code : FALLBACK_VERSION_CODE;
+            String name = info.versionName;
+            resolvedVersionName = name == null || name.trim().isEmpty()
+                    ? FALLBACK_VERSION_NAME : name.trim();
+        } catch (Exception error) {
+            Log.w(LOG_TAG, "读取安装版本号失败，使用兜底值: " + error);
+            resolvedVersionCode = FALLBACK_VERSION_CODE;
+            resolvedVersionName = FALLBACK_VERSION_NAME;
+        }
+    }
+
+    private String currentVersionName() {
+        resolveVersion();
+        return resolvedVersionName;
+    }
+
+    private int currentVersionCode() {
+        resolveVersion();
+        return resolvedVersionCode;
+    }
+
+    /** 读取指定 APK 文件的 versionCode。返回 0 表示无法解析。 */
+    private int packageVersionCode(File apk) {
+        try {
+            PackageInfo archive = getPackageManager()
+                    .getPackageArchiveInfo(apk.getAbsolutePath(), 0);
+            if (archive == null) {
+                return 0;
+            }
+            return Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                    ? (int) archive.getLongVersionCode()
+                    : archive.versionCode;
+        } catch (Exception ignored) {
+            return 0;
+        }
     }
 
     private int dp(int value) {

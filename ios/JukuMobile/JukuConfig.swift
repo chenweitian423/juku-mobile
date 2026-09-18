@@ -1,13 +1,32 @@
 import Foundation
 
-/// 全局常量。数值与 Android 端 `MainActivity.java` 顶部常量一一对应，
-/// 改版本号时两边必须同步（另见 `app/build.gradle` 与 `ios/project.yml`）。
+/// 全局常量。版本号**唯一事实来源是 `ios/project.yml`**（MARKETING_VERSION /
+/// CURRENT_PROJECT_VERSION，两者又由 CI 校验与 `app/build.gradle` 一致），
+/// 这里运行时从 `Info.plist` 读，不再硬编码第二份。
 enum JukuConfig {
 
     // MARK: - 版本
 
-    static let currentVersionName = "1.3.14"
-    static let currentVersionCode = 23
+    /// 打包后的 `CFBundleShortVersionString`；取不到时返回兜底值（理论上不会发生）。
+    static var currentVersionName: String {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+              !value.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return fallbackVersionName
+        }
+        return value
+    }
+
+    /// 打包后的 `CFBundleVersion`。
+    static var currentVersionCode: Int {
+        guard let raw = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              let value = Int(raw), value > 0 else {
+            return fallbackVersionCode
+        }
+        return value
+    }
+
+    private static let fallbackVersionName = "0.0.0"
+    private static let fallbackVersionCode = 1
 
     // MARK: - 服务器
 

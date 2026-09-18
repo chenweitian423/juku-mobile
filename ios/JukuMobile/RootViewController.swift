@@ -308,7 +308,7 @@ final class RootViewController: UIViewController {
         )
     }
 
-    /// 处理网页「更多」面板里注入条目的动作（server / update / clearcache / about）。
+    /// 处理网页「更多」面板里注入条目的动作（server / update / clearcache / restart / about）。
     private func handleNativeAction(_ action: String) {
         switch action {
         case "server":
@@ -317,10 +317,41 @@ final class RootViewController: UIViewController {
             checkForUpdate(userInitiated: true)
         case "clearcache":
             clearWebCacheAndReload()
+        case "restart":
+            restartClient()
         case "about":
             presentAbout()
         default:
             break
+        }
+    }
+
+    /// 重启客户端。
+    ///
+    /// iOS 不允许应用自杀后自拉起（会被系统判为崩溃），所以这里做的是等价的
+    /// **重建 Web 层**：停掉当前加载 → 清掉网页资源缓存（不动 Cookie，保住登录态）
+    /// → 重新载入首页，并把播放器沉浸 / 常亮等外壳状态复位。
+    /// 网页前端卡死（路由错乱、注入脚本状态异常）时，这比单纯「刷新」更彻底。
+    private func restartClient() {
+        applyPlayerState(active: false, controlsHidden: false, landscape: false)
+        applyPlaybackState(false)
+        webView.stopLoading()
+        // 只清资源缓存，保留 Cookie / LocalStorage，否则会把登录态一起清掉
+        let types = WKWebsiteDataStore.allWebsiteDataTypes().subtracting([
+            WKWebsiteDataTypeCookies,
+            WKWebsiteDataTypeLocalStorage,
+            WKWebsiteDataTypeOfflineWebApplicationCache
+        ])
+        WKWebsiteDataStore.default().removeData(
+            ofTypes: types,
+            modifiedSince: .distantPast
+        ) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.errorContainer.isHidden = true
+                self.loadConfiguredServer()
+                self.presentToast("已重启客户端")
+            }
         }
     }
 
@@ -360,6 +391,9 @@ final class RootViewController: UIViewController {
         })
         sheet.addAction(UIAlertAction(title: "刷新", style: .default) { [weak self] _ in
             self?.webView.reload()
+        })
+        sheet.addAction(UIAlertAction(title: "重启客户端", style: .default) { [weak self] _ in
+            self?.restartClient()
         })
         sheet.addAction(UIAlertAction(title: "清除网页缓存", style: .default) { [weak self] _ in
             self?.clearWebCacheAndReload()
@@ -428,6 +462,8 @@ final class RootViewController: UIViewController {
         标识：\(bundleID)
 
         iOS 不允许应用自行安装更新包，检查到新版本后会跳转浏览器下载。
+
+        页面卡住不动时，可在「⋯ → 重启客户端」里重建网页层。
         """
         let alert = UIAlertController(title: "关于", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "关闭", style: .cancel))
@@ -847,7 +883,7 @@ extension RootViewController {
             label.className = 'small';
             label.textContent = '客户端';
             if (anchor) { panel.insertBefore(label, anchor); } else { panel.appendChild(label); }
-            var items = [['server', '服务器地址'], ['update', '检查更新'], ['clearcache', '清除网页缓存'], ['about', '关于']];
+            var items = [['server', '服务器地址'], ['update', '检查更新'], ['clearcache', '清除网页缓存'], ['restart', '重启客户端'], ['about', '关于']];
             for (var i = 0; i < items.length; i++) {
               var key = items[i][0], text = items[i][1];
               var btn = document.createElement('button');

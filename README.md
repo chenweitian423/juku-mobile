@@ -67,50 +67,68 @@ CI 在出包后会断言证书指纹等于 `b23d08d3e4e21b051ecc09e8277b669d8b60
 
 ## 在线更新机制
 
-客户端启动后按 12 小时间隔、以及从后台回到前台（距上次检查超 30 分钟）时，
-请求 `{服务器}/api/mobile/update`：
+客户端启动后按 12 小时间隔、以及从后台回到前台（距上次检查超 30 分钟）时取更新信息。
+
+### 更新通道：多级回退（1.3.17 起）
+
+**更新通道刻意不绑在业务服务上。** 曾经只认 `{服务器}/api/mobile/update`，结果上游新版
+把这组接口整组下线（连 `publish-mobile-update.sh` 一起删），手机端的检查更新/下载全断，
+而且**存量已装版本无法自救**（旧客户端只会调那个接口，发新版客户端它也下载不到）。
+现在按顺序尝试，第一个成功的即采用：
+
+| 顺序 | 源 | 地址 | 说明 |
+|---|---|---|---|
+| ① | 自定义源 | 菜单「更新源地址」里填的地址 | 留空则不参与；可填目录（以 `/` 结尾，会取该目录下的 `update.json`）或完整 `update.json` 地址 |
+| ② | 服务器 | `{服务器}/api/mobile/update` | 服务端若恢复该接口就自动用上，无需改客户端 |
+| ③ | GitHub Release | `https://github.com/chenweitian423/juku-mobile/releases/latest/download/update.json` | **不需要 API、不需要登录**，CI 每次发版都发这个附件，天生存在 |
+
+- 上次成功的源会被记住并优先尝试，避免每次从失效的源开始等超时。
+- 下载地址解析支持三种形态：**绝对地址**直接用；**相对地址**只在「源的基准」下拼
+  （`/api/mobile/apk?name=…` 是服务端约定，拿去 GitHub 拼必然 404）；什么都没给时按该源
+  的资产命名约定兜底（GitHub 是 `juku-mobile-<版本>.apk`）。
+- 401/403 会被明确识别为「该更新源需要登录」——服务端新版是**全局鉴权**，未登录时
+  任何路径都返回 401（包括不存在的路径），所以**别用状态码判断接口在不在**，用二进制 grep。
+- 「⋯ → 更新源地址」可随时切换/清空；「关于」页会显示当前生效的源与下载直链。
 
 ```json
 {
-  "versionCode": 12,
-  "versionName": "1.3.3",
+  "versionCode": 26,
+  "versionName": "1.3.17",
   "sha256": "45D81D9D…",
   "size": 41991,
   "notes": "更新说明",
-  "apkUrl": "/api/mobile/apk"
+  "apkUrl": "https://github.com/…/releases/latest/download/juku-mobile-1.3.17.apk",
+  "ipaUrl": "https://github.com/…/releases/latest/download/juku-mobile-1.3.17-unsigned.ipa"
 }
 ```
 
-- 服务端返回的 `versionCode` 大于本地 `CURRENT_VERSION_CODE` 才提示更新。
-- 所以要推送新版本，除了发 APK 还要同步服务端 `update.json`。
-  该文件由 CI 随包生成（Release 附件），sha256/size 是机器填的，别手工搬运 —— 见下节。
+- 返回的 `versionCode` 大于本地版本才提示更新。
+- CI 会把 `apkUrl`/`ipaUrl` 写成 **GitHub 绝对地址**；服务端那份被服务端 handler 重新序列化
+  时会换成它自己的相对地址，客户端两边都能正确解析。
 
 ### 发布新版本的操作顺序
 
-一条命令（拉取 + 配对校验 + 推送 + 公网回验）：
+**主要通道是 GitHub Release**（CI 出包即完成发布，客户端走上面的 ③）：
 
-```bash
-./ship.sh              # 最新 Release
-./ship.sh v1.3.5       # 指定版本
-```
-
-它内部就是 `fetch-artifacts.sh` + `publish-to-server.sh`，也可以分步跑。
-推送脚本有三道防护：**推前**校验 `update.json` 与 APK 的 sha256/size 配对、
-**推后**从公网重新下载逐个核对、**推前**把服务端旧文件备份到宿主机 `/tmp`。
-
-手动等价步骤：
 1. 改版本号（`app/build.gradle` + `ios/project.yml`，两端必须一致）
 2. 提交推送等 `Build Android APK` 跑完；iOS 另跑 `Build iOS IPA`
-3. 产物下载到 `dist/`：APK、IPA、`update.json`
-4. `dist/juku-mobile-<版本>.apk` → 服务端 `/data/mobile/juku-mobile.apk`
-5. `dist/juku-mobile-<版本>-unsigned.ipa` → `/data/mobile/juku-mobile-unsigned.ipa`
-6. `dist/update.json` → `/data/mobile/update.json`
+3. 完事 —— 客户端下次检查就会看到新版本
+
+**服务端镜像（可选）**：只有当你**希望服务端也提供一份**（例如国内直连更快）时才需要。
+
+```bash
+./fetch-artifacts.sh   # 只拉产物到 dist/
+./ship.sh              # 额外把产物推到服务端 /data/mobile/ 并做公网回验
+```
+
+> ⚠️ **服务端接口一旦不存在（如上游新版删掉了 `/api/mobile/*`），`ship.sh` 推过去也没用** ——
+> 文件在盘上但 HTTP 取不到。此时客户端会自动回退到 GitHub 源，无需任何改动。
 
 > ⚠️ **APK 的 sha256 每次构建都会变，且不可复现**：AGP 产出的 zip 条目时间戳随构建时间变化，
 > 同源码重复构建（甚至设 `SOURCE_DATE_EPOCH`）也拿不到相同摘要。
-> 后果是：同一 Release 资产被后续构建 `--clobber` 覆盖后，之前抄下来的 sha256 立刻失效，
-> 客户端完整性校验不通过、更新装不上。
-> 因此第 5 步务必用**与该 APK 同一次构建产出**的 `update.json` —— 两者在同一个 Release 里，天然配对。
+> 所以推服务端时必须用**与该 APK 同一次构建产出**的 `update.json`（同一个 Release 里，天然配对），
+> 推送脚本的推前配对校验就是拦这个。
+
 
 两端更新行为不同，这是平台限制而非实现差异：
 

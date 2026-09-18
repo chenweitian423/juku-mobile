@@ -94,6 +94,12 @@ public class MainActivity extends Activity {
     private static final String KEY_UPDATE_TRACE = "update_trace";
     private static final String KEY_WEB_CACHE_VERSION = "web_cache_version";
     private static final String KEY_NOTIFICATION_ASKED = "notification_permission_asked";
+    /** 自定义更新源（留空 = 自动：服务器 → GitHub）。 */
+    private static final String KEY_UPDATE_SOURCE_OVERRIDE = "update_source_override";
+    /** 上次可用的更新源 key —— 下次优先尝试它，避免每次从失效的源开始等超时。 */
+    private static final String KEY_LAST_GOOD_SOURCE = "last_good_update_source";
+    /** 上次成功解析到的安装包直链 —— 「浏览器下载」和「关于」页用它。 */
+    private static final String KEY_LAST_APK_URL = "last_apk_url";
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
@@ -115,6 +121,20 @@ public class MainActivity extends Activity {
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1003;
     private static final long AUTO_UPDATE_INTERVAL_MS = 12L * 60L * 60L * 1000L;
     private static final long MIN_FOREGROUND_RECHECK_MS = 30L * 60L * 1000L;
+
+    /**
+     * GitHub Release 的固定下载前缀。
+     *
+     * `releases/latest/download/<资产名>` 是**不需要 API、不需要登录**的稳定地址，
+     * CI 每次发版都会把 APK / IPA / update.json 作为附件发布，所以这个源天生就存在，
+     * 不受业务服务端改动影响（这正是本次改造的目的）。
+     */
+    private static final String GITHUB_LATEST_DOWNLOAD =
+            "https://github.com/chenweitian423/juku-mobile/releases/latest/download/";
+
+    /** 查更新信息用的超时（源可能有好几个，单个源别等太久）。 */
+    private static final int UPDATE_CONNECT_TIMEOUT_MS = 8000;
+    private static final int UPDATE_READ_TIMEOUT_MS = 12000;
 
     /** 整页加载看门狗：超过这个时间且进度还几乎没动，就判定卡住并给出可点击的重试页。 */
     private static final long PAGE_LOAD_WATCHDOG_MS = 25_000L;
@@ -458,6 +478,9 @@ public class MainActivity extends Activity {
         switch (action) {
             case "server":
                 showServerDialog();
+                break;
+            case "updatesource":
+                showUpdateSourceDialog();
                 break;
             case "update":
                 checkForUpdate(true);
@@ -841,7 +864,7 @@ public class MainActivity extends Activity {
                 + "label.className='small';"
                 + "label.textContent='客户端';"
                 + "if(anchor){panel.insertBefore(label,anchor);}else{panel.appendChild(label);}"
-                + "var items=[['server','服务器地址'],['update','检查更新'],['clearcache','清除网页缓存'],['restart','重启客户端'],['about','关于']];"
+                + "var items=[['server','服务器地址'],['updatesource','更新源地址'],['update','检查更新'],['clearcache','清除网页缓存'],['restart','重启客户端'],['about','关于']];"
                 + "for(var i=0;i<items.length;i++){"
                 + "var key=items[i][0],text=items[i][1];"
                 + "var b=document.createElement('button');"
@@ -1070,7 +1093,7 @@ public class MainActivity extends Activity {
         if (isFinishing()) {
             return;
         }
-        String[] items = {"服务器地址", "刷新", "重启客户端", "清除网页缓存", "检查更新", "回到首页", "关于"};
+        String[] items = {"服务器地址", "更新源地址", "刷新", "重启客户端", "清除网页缓存", "检查更新", "回到首页", "关于"};
         new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                 .setTitle(R.string.app_name)
                 .setItems(items, (dialog, which) -> {
@@ -1079,6 +1102,9 @@ public class MainActivity extends Activity {
                             showServerDialog();
                             break;
                         case 1:
+                            showUpdateSourceDialog();
+                            break;
+                        case 2:
                             showingError = false;
                             errorView.setVisibility(View.GONE);
                             if (webView.getUrl() == null && webView.getOriginalUrl() == null) {
@@ -1087,20 +1113,20 @@ public class MainActivity extends Activity {
                                 webView.reload();
                             }
                             break;
-                        case 2:
+                        case 3:
                             restartClient();
                             break;
-                        case 3:
+                        case 4:
                             clearWebCacheAndReload();
                             break;
-                        case 4:
+                        case 5:
                             checkForUpdate(true);
                             break;
-                        case 5:
+                        case 6:
                             String address = preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL);
                             webView.loadUrl(normalizeServerUrl(address));
                             break;
-                        case 6:
+                        case 7:
                             showAboutDialog();
                             break;
                         default:
@@ -1279,12 +1305,13 @@ public class MainActivity extends Activity {
     private void showAboutDialog() {
         String server = normalizeServerUrl(preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL));
         String signature = describeSignature();
-        String downloadUrl = server + "api/mobile/apk?name=juku-mobile.apk";
+        String downloadUrl = bestKnownDownloadUrl();
         StringBuilder text = new StringBuilder()
                 .append("应用：果果剧库 手机版\n")
                 .append("版本：").append(currentVersionName())
                 .append("（versionCode ").append(currentVersionCode()).append("）\n")
                 .append("服务器：").append(server).append("\n")
+                .append("更新源：").append(describeActiveUpdateSource()).append("\n")
                 .append("设备：").append(describeDevice()).append("\n")
                 // 安装来源放进诊断信息：Android 14+ 的「更新归属」会让非本应用安装的包
                 // 在应用内更新时被系统静默压住，这一行能直接看出是不是这个原因。
@@ -1458,13 +1485,49 @@ public class MainActivity extends Activity {
         }, "juku-update-check").start();
     }
 
+    /**
+     * 依次尝试各个更新源，第一个成功的即采用。
+     *
+     * ★ 为什么要这样：更新通道原来**只认服务端的 `/api/mobile/update`**，而服务端
+     * （剧库本体）在上游新版里把这个接口整组下线了 —— 业务服务一升级，手机端的
+     * 检查更新/下载就跟着一起失效，而且**存量已装版本无法自救**。
+     * 更新通道本来就不该绑在业务服务上，所以改成多级：
+     *
+     *   ① 自定义源（用户可在「更新源地址」里填自己的静态地址，最高优先）
+     *   ② 服务器（`{服务器}/api/mobile/update`；服务端若恢复了这个接口就自动用上）
+     *   ③ GitHub Release 附件（CI 每次发版都会发布 update.json，天然存在、无需登录）
+     *
+     * 上次成功的源会被记住并优先尝试，避免每次都从失效的源开始等超时。
+     */
     private MobileUpdate fetchMobileUpdate() throws Exception {
-        String server = normalizeServerUrl(preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL));
-        URL url = new URL(new URL(server), "api/mobile/update");
+        java.util.List<UpdateSource> sources = updateSources();
+        Exception lastError = null;
+        for (UpdateSource source : sources) {
+            try {
+                MobileUpdate update = fetchFromSource(source);
+                preferences().edit()
+                        .putString(KEY_LAST_GOOD_SOURCE, source.key)
+                        .putString(KEY_LAST_APK_URL, update.apkUrl.toString())
+                        .apply();
+                noteUpdateStep("更新源可用：" + source.label);
+                return update;
+            } catch (Exception error) {
+                lastError = error;
+                noteUpdateStep("更新源不可用（" + source.label + "）：" + updateError(error));
+            }
+        }
+        throw new IOException("所有更新源都不可用（最后错误："
+                + updateError(lastError) + "）");
+    }
+
+    private MobileUpdate fetchFromSource(UpdateSource source) throws Exception {
+        URL url = new URL(source.manifestUrl);
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-        connection.setConnectTimeout(10000);
-        connection.setReadTimeout(15000);
+        connection.setConnectTimeout(UPDATE_CONNECT_TIMEOUT_MS);
+        connection.setReadTimeout(UPDATE_READ_TIMEOUT_MS);
         connection.setUseCaches(false);
+        // GitHub 的 release 资产会 302 跳到 release-assets.githubusercontent.com，必须跟随
+        connection.setInstanceFollowRedirects(true);
         connection.setRequestProperty("Accept", "application/json");
         connection.setRequestProperty("User-Agent", "JukuMobile/" + currentVersionName());
         try {
@@ -1474,9 +1537,7 @@ public class MainActivity extends Activity {
                     : connection.getErrorStream();
             String body = readText(stream);
             if (status != HttpURLConnection.HTTP_OK) {
-                throw new IOException(status == HttpURLConnection.HTTP_NOT_FOUND
-                        ? "服务器还没有发布手机端更新"
-                        : "服务器返回 " + status);
+                throw new IOException(describeHttpStatus(status));
             }
             JSONObject json = new JSONObject(body);
             MobileUpdate update = new MobileUpdate();
@@ -1485,11 +1546,114 @@ public class MainActivity extends Activity {
             update.sha256 = json.optString("sha256", "");
             update.notes = json.optString("notes", "本次更新包含功能优化和问题修复。");
             update.size = json.optLong("size", 0L);
-            String apkUrl = json.optString("apkUrl", "/api/mobile/apk");
-            update.apkUrl = new URL(new URL(server), apkUrl);
+            update.apkUrl = resolveAssetUrl(source, json.optString("apkUrl", ""),
+                    source.versionedAsset
+                            ? "juku-mobile-" + update.versionName + ".apk"
+                            : "juku-mobile.apk");
             return update;
         } finally {
             connection.disconnect();
+        }
+    }
+
+    /**
+     * 把 manifest 里的下载地址解析成可用的 URL。
+     *
+     * 三种形态都要能处理：
+     *   ① 绝对地址（`http(s)://…`）—— 直接用（服务端补回接口后就是这种；
+     *      CI 之后也会往 update.json 里写 GitHub 的绝对地址）
+     *   ② 相对地址 —— 只在**源的基准**下拼（服务器源才能拼，因为
+     *      `/api/mobile/apk?name=…` 是服务端约定；换成 GitHub 就拼出 404 了）
+     *   ③ 什么都没给 —— 按该源的资产命名约定兜底
+     */
+    private URL resolveAssetUrl(UpdateSource source, String raw, String fallbackName) throws Exception {
+        if (raw != null && !raw.trim().isEmpty()) {
+            String value = raw.trim();
+            if (value.startsWith("http://") || value.startsWith("https://")) {
+                return new URL(value);
+            }
+            if (source.relativeBase != null) {
+                return new URL(new URL(source.relativeBase), value);
+            }
+        }
+        return new URL(source.assetPrefix + fallbackName);
+    }
+
+    private String describeHttpStatus(int status) {
+        if (status == HttpURLConnection.HTTP_UNAUTHORIZED || status == HttpURLConnection.HTTP_FORBIDDEN) {
+            // 服务端新版是全局鉴权：未登录时**任何**路径都返回 401（连不存在的也是），
+            // 所以 401 只说明"这条路走不通"，不代表接口还在
+            return "该更新源需要登录（HTTP " + status + "）";
+        }
+        if (status == HttpURLConnection.HTTP_NOT_FOUND) {
+            return "该更新源没有发布信息（HTTP 404）";
+        }
+        return "HTTP " + status;
+    }
+
+    /** 组装更新源列表（自定义 → 服务器 → GitHub），上次可用的排最前。 */
+    private java.util.List<UpdateSource> updateSources() {
+        java.util.List<UpdateSource> list = new java.util.ArrayList<>();
+        String custom = preferences().getString(KEY_UPDATE_SOURCE_OVERRIDE, "").trim();
+        if (!custom.isEmpty()) {
+            list.add(new UpdateSource("custom", "自定义源", normalizeManifestUrl(custom), null, custom, false));
+        }
+        String server = normalizeServerUrl(preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL));
+        list.add(new UpdateSource("server", "服务器",
+                server + "api/mobile/update", server, server + "api/mobile/apk?name=", false));
+        list.add(new UpdateSource("github", "GitHub",
+                GITHUB_LATEST_DOWNLOAD + "update.json", null, GITHUB_LATEST_DOWNLOAD, true));
+
+        String lastGood = preferences().getString(KEY_LAST_GOOD_SOURCE, "");
+        if (!lastGood.isEmpty()) {
+            for (int index = 0; index < list.size(); index++) {
+                if (lastGood.equals(list.get(index).key)) {
+                    list.add(0, list.remove(index));
+                    break;
+                }
+            }
+        }
+        return list;
+    }
+
+    /** 自定义源地址：允许只填目录（以 `/` 结尾）或完整的 update.json 地址。 */
+    private String normalizeManifestUrl(String raw) {
+        String value = raw.trim();
+        if (!value.startsWith("http://") && !value.startsWith("https://")) {
+            value = "http://" + value;
+        }
+        if (value.endsWith("/")) {
+            value = value + "update.json";
+        }
+        return value;
+    }
+
+    /**
+     * 一个更新源。
+     *
+     * @param key            稳定标识（记录"上次可用"用）
+     * @param label          展示名（写进更新记录）
+     * @param manifestUrl    去哪取 update.json
+     * @param relativeBase   manifest 里给**相对**下载地址时的解析基准；null = 不允许相对
+     * @param assetPrefix    按约定造下载地址时的前缀
+     * @param versionedAsset 资产名是否带版本号（GitHub 是 `juku-mobile-<版本>.apk`）
+     */
+    private static final class UpdateSource {
+        final String key;
+        final String label;
+        final String manifestUrl;
+        final String relativeBase;
+        final String assetPrefix;
+        final boolean versionedAsset;
+
+        UpdateSource(String key, String label, String manifestUrl,
+                     String relativeBase, String assetPrefix, boolean versionedAsset) {
+            this.key = key;
+            this.label = label;
+            this.manifestUrl = manifestUrl;
+            this.relativeBase = relativeBase;
+            this.assetPrefix = assetPrefix;
+            this.versionedAsset = versionedAsset;
         }
     }
 
@@ -1530,11 +1694,87 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /**
+     * 「更新源地址」设置。
+     *
+     * 留空 = 自动：先试服务器（`{服务器}/api/mobile/update`，服务端若恢复该接口就自动生效），
+     * 失败则回退 GitHub Release 附件。也可以填自己的静态地址 ——
+     * 目录形式（以 `/` 结尾，会取该目录下的 `update.json`）或完整的 update.json 地址。
+     * 业务服务端把接口下线后，这是"不改服务端也能继续更新"的那条路。
+     */
+    private void showUpdateSourceDialog() {
+        EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        input.setSingleLine(true);
+        input.setText(preferences().getString(KEY_UPDATE_SOURCE_OVERRIDE, ""));
+        input.setHint("留空 = 自动");
+        input.setSelectAllOnFocus(true);
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(Color.parseColor("#7C838E"));
+        int padding = dp(22);
+        FrameLayout wrapper = new FrameLayout(this);
+        wrapper.setPadding(padding, dp(8), padding, 0);
+        wrapper.addView(input, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        AlertDialog dialog = new AlertDialog.Builder(this, R.style.JukuDialogTheme)
+                .setTitle("更新源地址")
+                .setMessage("留空 = 自动（服务器 → GitHub）\n\n"
+                        + "也可以填自己的静态地址，例如 http://1.2.3.4/mobile/"
+                        + "（会自动去取该目录下的 update.json）\n\n"
+                        + "当前：" + describeActiveUpdateSource())
+                .setView(wrapper)
+                .setPositiveButton("保存", null)
+                .setNegativeButton("取消", null)
+                .setNeutralButton("清空", null)
+                .create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                String value = input.getText().toString().trim();
+                preferences().edit()
+                        .putString(KEY_UPDATE_SOURCE_OVERRIDE, value)
+                        // 换源后"上次可用"就不再成立了，清掉重新判定
+                        .remove(KEY_LAST_GOOD_SOURCE)
+                        .apply();
+                Toast.makeText(this,
+                        value.isEmpty() ? "已恢复自动选择更新源" : "已保存更新源",
+                        Toast.LENGTH_SHORT).show();
+                dialog.dismiss();
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> input.setText(""));
+        });
+        dialog.show();
+    }
+
+    /** 一句话说明当前会走哪个更新源（「更新源地址」对话框与「关于」页共用）。 */
+    private String describeActiveUpdateSource() {
+        String custom = preferences().getString(KEY_UPDATE_SOURCE_OVERRIDE, "").trim();
+        if (!custom.isEmpty()) {
+            return "自定义源 " + normalizeManifestUrl(custom);
+        }
+        String lastGood = preferences().getString(KEY_LAST_GOOD_SOURCE, "");
+        if ("github".equals(lastGood)) {
+            return "GitHub Release（自动回退）";
+        }
+        if ("server".equals(lastGood)) {
+            return "服务器接口";
+        }
+        return "自动（服务器 → GitHub）";
+    }
+
+    /** 已知可用的安装包直链；没有就返回 GitHub 的版本列表页（浏览器能用）。 */
+    private String bestKnownDownloadUrl() {
+        String cached = preferences().getString(KEY_LAST_APK_URL, "").trim();
+        if (!cached.isEmpty()) {
+            return cached;
+        }
+        return GITHUB_LATEST_DOWNLOAD.replace("/releases/latest/download/", "/releases/latest");
+    }
+
     /** 用系统浏览器打开安装包地址 —— 应用内更新完全走不通时的最后一条路。 */
     private void openDownloadInBrowser() {
-        String url = normalizeServerUrl(
-                preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL))
-                + "api/mobile/apk?name=juku-mobile.apk";
+        String url = bestKnownDownloadUrl();
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
             noteUpdateStep("已交给浏览器下载：" + url);

@@ -189,13 +189,16 @@ jobs:
           fi
           PUBLISHED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          # 结构对齐服务端 /data/mobile/update.json，apkName/ipaUrl 直接写成服务端约定值，
-          # 因此这份文件可以整份替换过去，不需要手工改任何字段。
-          # ipaUrl 供 iOS 端读取（iOS 走服务器自己的 IPA，比 GitHub 快且国内可达）；
-          # Android 端不读这个字段，加了不影响。
+          # 结构对齐服务端 /data/mobile/update.json。
+          # ★ apkUrl / ipaUrl 写**绝对**地址，指向 GitHub Release 的固定前缀
+          #   `releases/latest/download/`（不需要 API、不需要登录，且不受业务服务端改动影响）。
+          #   手机端现在按「自定义源 → 服务器 → GitHub」多级回退取更新信息，
+          #   服务端那份 update.json 被服务端 handler 重新序列化时会把 apkUrl 换成它自己的
+          #   相对地址，客户端两边都能正确解析（见 resolveAssetUrl / resolveAssetURL）。
+          # ipaUrl 供 iOS 端读取。
           # 用 python 生成以免 notes 里的引号/换行破坏 JSON；单行 -c 规避 YAML 缩进。
-          python3 -c "import json,sys;print(json.dumps({'versionCode':int(sys.argv[1]),'versionName':sys.argv[2],'sha256':sys.argv[3],'size':int(sys.argv[4]),'notes':sys.argv[5],'publishedAt':sys.argv[6],'apkName':'juku-mobile.apk','ipaUrl':'/api/mobile/apk?name=juku-mobile-unsigned.ipa'},ensure_ascii=False,indent=2))" \
-            "$VERSION_CODE" "$VERSION_NAME" "$APK_SHA256" "$APK_SIZE" "$NOTES" "$PUBLISHED" \
+          python3 -c "import json,sys;ver=sys.argv[2];base='https://github.com/'+sys.argv[7]+'/releases/latest/download/';print(json.dumps({'versionCode':int(sys.argv[1]),'versionName':ver,'sha256':sys.argv[3],'size':int(sys.argv[4]),'notes':sys.argv[5],'publishedAt':sys.argv[6],'apkName':'juku-mobile.apk','apkUrl':base+'juku-mobile-'+ver+'.apk','ipaUrl':base+'juku-mobile-'+ver+'-unsigned.ipa'},ensure_ascii=False,indent=2))" \
+            "$VERSION_CODE" "$VERSION_NAME" "$APK_SHA256" "$APK_SIZE" "$NOTES" "$PUBLISHED" "${{ github.repository }}" \
             > artifacts/update.json
 
           echo "--- artifacts/update.json ---"

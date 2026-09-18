@@ -8,6 +8,9 @@ struct ServerStore {
         static let serverURL = "server_url"
         static let lastUpdateCheck = "last_update_check"
         static let webCacheVersion = "web_cache_version"
+        static let updateSourceOverride = "update_source_override"
+        static let lastGoodSource = "last_good_update_source"
+        static let lastAPKURL = "last_apk_url"
     }
 
     private let defaults: UserDefaults
@@ -37,6 +40,41 @@ struct ServerStore {
     /// 恢复默认地址。
     mutating func resetServerURL() {
         serverURL = JukuConfig.defaultServerURL
+    }
+
+    // MARK: - 更新源
+
+    /// 自定义更新源（可为空 = 自动：服务器 → GitHub）。
+    var updateSourceOverride: String {
+        get { defaults.string(forKey: Key.updateSourceOverride) ?? "" }
+        set { defaults.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines),
+                           forKey: Key.updateSourceOverride) }
+    }
+
+    /// 上次可用的更新源 key（"server" / "github"）—— 下次优先尝试它。
+    var lastGoodUpdateSource: String {
+        get { defaults.string(forKey: Key.lastGoodSource) ?? "" }
+        set { defaults.set(newValue, forKey: Key.lastGoodSource) }
+    }
+
+    /// 上次成功解析到的安装包直链。
+    var lastAPKURL: String {
+        get { defaults.string(forKey: Key.lastAPKURL) ?? "" }
+        set { defaults.set(newValue, forKey: Key.lastAPKURL) }
+    }
+
+    /// 自定义源地址规范化：允许只填目录（以 `/` 结尾）或完整的 update.json 地址。
+    static func normalizeManifestURL(_ raw: String) -> String? {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        let lower = value.lowercased()
+        if !lower.hasPrefix("http://") && !lower.hasPrefix("https://") {
+            value = "http://" + value
+        }
+        if value.hasSuffix("/") {
+            value += "update.json"
+        }
+        return value
     }
 
     // MARK: - 更新节奏

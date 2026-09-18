@@ -308,11 +308,13 @@ final class RootViewController: UIViewController {
         )
     }
 
-    /// 处理网页「更多」面板里注入条目的动作（server / update / clearcache / restart / about）。
+    /// 处理网页「更多」面板里注入条目的动作（server / updatesource / update / clearcache / restart / about）。
     private func handleNativeAction(_ action: String) {
         switch action {
         case "server":
             presentServerDialog()
+        case "updatesource":
+            presentUpdateSourceDialog()
         case "update":
             checkForUpdate(userInitiated: true)
         case "clearcache":
@@ -324,6 +326,62 @@ final class RootViewController: UIViewController {
         default:
             break
         }
+    }
+
+    /// 「更新源地址」设置：留空 = 自动（服务器 → GitHub）。
+    private func presentUpdateSourceDialog() {
+        let alert = UIAlertController(
+            title: "更新源地址",
+            message: "留空 = 自动（服务器 → GitHub）\n\n"
+                + "也可以填自己的静态地址，例如 http://1.2.3.4/mobile/"
+                + "（会自动去取该目录下的 update.json）\n\n"
+                + "当前：\(describeActiveUpdateSource())",
+            preferredStyle: .alert
+        )
+        alert.addTextField { [weak self] field in
+            field.placeholder = "留空 = 自动"
+            field.text = self?.store.updateSourceOverride
+            field.keyboardType = .URL
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+            field.clearButtonMode = .whileEditing
+        }
+        alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self, weak alert] _ in
+            guard let self else { return }
+            self.store.updateSourceOverride = alert?.textFields?.first?.text ?? ""
+            // 换源后"上次可用"就不再成立，清掉重新判定
+            self.store.lastGoodUpdateSource = ""
+            self.presentToast("已保存更新源")
+        })
+        alert.addAction(UIAlertAction(title: "清空", style: .destructive) { [weak self] _ in
+            guard let self else { return }
+            self.store.updateSourceOverride = ""
+            self.store.lastGoodUpdateSource = ""
+            self.presentToast("已恢复自动选择更新源")
+        })
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    /// 一句话说明当前会走哪个更新源。
+    private func describeActiveUpdateSource() -> String {
+        if !store.updateSourceOverride.isEmpty {
+            return "自定义源 \(ServerStore.normalizeManifestURL(store.updateSourceOverride) ?? "")"
+        }
+        switch store.lastGoodUpdateSource {
+        case "github": return "GitHub Release（自动回退）"
+        case "server": return "服务器接口"
+        default: return "自动（服务器 → GitHub）"
+        }
+    }
+
+    /// 已知可用的安装包直链；没有就返回 GitHub 的版本列表页。
+    private func bestKnownDownloadURL() -> String {
+        if !store.lastAPKURL.isEmpty {
+            return store.lastAPKURL
+        }
+        return JukuConfig.githubLatestDownload
+            .replacingOccurrences(of: "/releases/latest/download/", with: "/releases/latest")
     }
 
     /// 重启客户端。
@@ -388,6 +446,9 @@ final class RootViewController: UIViewController {
         let sheet = UIAlertController(title: "果果剧库", message: nil, preferredStyle: .actionSheet)
         sheet.addAction(UIAlertAction(title: "服务器地址", style: .default) { [weak self] _ in
             self?.presentServerDialog()
+        })
+        sheet.addAction(UIAlertAction(title: "更新源地址", style: .default) { [weak self] _ in
+            self?.presentUpdateSourceDialog()
         })
         sheet.addAction(UIAlertAction(title: "刷新", style: .default) { [weak self] _ in
             self?.webView.reload()
@@ -458,10 +519,13 @@ final class RootViewController: UIViewController {
         应用：果果剧库 iOS 版
         版本：\(version) (build \(build))
         服务器：\(store.serverURL)
+        更新源：\(describeActiveUpdateSource())
         设备：\(UIDevice.current.model) / \(system)
         标识：\(bundleID)
 
         iOS 不允许应用自行安装更新包，检查到新版本后会跳转浏览器下载。
+        也可直接用浏览器打开下面这个地址：
+        \(bestKnownDownloadURL())
 
         页面卡住不动时，可在「⋯ → 重启客户端」里重建网页层。
         """
@@ -515,7 +579,7 @@ final class RootViewController: UIViewController {
         updateTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let update = try await UpdateService.fetch(server: self.store.serverURL)
+                let update = try await UpdateService.fetch(store: self.store)
                 await MainActor.run {
                     self.updateCheckRunning = false
                     self.store.lastUpdateCheck = Date()
@@ -883,7 +947,7 @@ extension RootViewController {
             label.className = 'small';
             label.textContent = '客户端';
             if (anchor) { panel.insertBefore(label, anchor); } else { panel.appendChild(label); }
-            var items = [['server', '服务器地址'], ['update', '检查更新'], ['clearcache', '清除网页缓存'], ['restart', '重启客户端'], ['about', '关于']];
+            var items = [['server', '服务器地址'], ['updatesource', '更新源地址'], ['update', '检查更新'], ['clearcache', '清除网页缓存'], ['restart', '重启客户端'], ['about', '关于']];
             for (var i = 0; i < items.length; i++) {
               var key = items[i][0], text = items[i][1];
               var btn = document.createElement('button');

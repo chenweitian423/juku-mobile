@@ -59,6 +59,19 @@ enum JukuConfig {
     static let updateAPIPath = "api/mobile/update"
     static let apkAPIPath = "api/mobile/apk"
 
+    // MARK: - 兜底更新源（GitHub Release）
+
+    /// `releases/latest/download/<资产名>` 是**不需要 API、不需要登录**的稳定地址，
+    /// CI 每次发版都会把 APK / IPA / update.json 作为附件发布，因此这个源天生存在。
+    ///
+    /// 为什么要有它：服务端（剧库本体）上游新版把 `/api/mobile/*` 整组下线了，
+    /// 手机端的检查更新/下载随之全断，而且**存量已装版本无法自救**。
+    /// 更新通道不该绑在业务服务上，所以改成多级回退（自定义源 → 服务器 → GitHub）。
+    static let githubLatestDownload =
+        "https://github.com/chenweitian423/juku-mobile/releases/latest/download/"
+
+    static let githubManifestURL = githubLatestDownload + "update.json"
+
     /// 服务端发布目录里 IPA 的固定文件名（与 APK 同目录、共用同一个下载接口，只是文件名不同）。
     ///
     /// 为什么要在客户端硬编码这个名字：实测服务端 `api/mobile/update` 是**它自己重新序列化**的

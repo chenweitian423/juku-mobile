@@ -78,8 +78,23 @@ CI 在出包后会断言证书指纹等于 `b23d08d3e4e21b051ecc09e8277b669d8b60
 ```
 
 - 服务端返回的 `versionCode` 大于本地 `CURRENT_VERSION_CODE` 才提示更新。
-- 所以要推送新版本，除了发 APK 还要同步服务端 `update.json` 的
-  `versionCode / versionName / sha256 / size`。
+- 所以要推送新版本，除了发 APK 还要同步服务端 `update.json`。
+  该文件由 CI 随包生成（Release 附件），sha256/size 是机器填的，别手工搬运 —— 见下节。
+
+### 发布新版本的操作顺序
+
+1. 改版本号（`app/build.gradle` + `ios/project.yml`，两端必须一致）
+2. 提交推送，等 `Build Android APK` 跑完
+3. `./fetch-artifacts.sh` 把产物拉到 `dist/`
+4. 把 `dist/juku-mobile-<版本>.apk` 传到服务端 `/data/mobile/juku-mobile.apk`
+5. 把 `dist/update.json` **整份替换**服务端 `/data/mobile/update.json`
+   （`apkName` 已按服务端约定写成 `juku-mobile.apk`，无需改动）
+
+> ⚠️ **APK 的 sha256 每次构建都会变，且不可复现**：AGP 产出的 zip 条目时间戳随构建时间变化，
+> 同源码重复构建（甚至设 `SOURCE_DATE_EPOCH`）也拿不到相同摘要。
+> 后果是：同一 Release 资产被后续构建 `--clobber` 覆盖后，之前抄下来的 sha256 立刻失效，
+> 客户端完整性校验不通过、更新装不上。
+> 因此第 5 步务必用**与该 APK 同一次构建产出**的 `update.json` —— 两者在同一个 Release 里，天然配对。
 
 两端更新行为不同，这是平台限制而非实现差异：
 

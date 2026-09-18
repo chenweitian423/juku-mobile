@@ -22,6 +22,9 @@ captures
 *.ap_
 *.dex
 
+# 用 fetch-artifacts.sh 从 Release 拉回来的产物
+dist
+
 # Gradle Wrapper 的 jar 必须入库（gradlew 靠它自举）。
 # 当前规则未使用 *.jar，此处显式声明以免日后误加全局 jar 排除时伤到它。
 !gradle/wrapper/gradle-wrapper.jar

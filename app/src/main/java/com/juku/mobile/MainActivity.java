@@ -81,8 +81,8 @@ public class MainActivity extends Activity {
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.4";
-    private static final int CURRENT_VERSION_CODE = 13;
+    private static final String CURRENT_VERSION_NAME = "1.3.5";
+    private static final int CURRENT_VERSION_CODE = 14;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final long AUTO_UPDATE_INTERVAL_MS = 12L * 60L * 60L * 1000L;

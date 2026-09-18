@@ -104,12 +104,8 @@ else
   echo "  ❌ size 不匹配"; FAIL=1
 fi
 if [ "$HAS_IPA" = "1" ]; then
-  IPA_URL=$(json_field "$UPDATE_JSON" ipaUrl)
-  if [ -n "$IPA_URL" ]; then
-    echo "  ✅ update.json 带 ipaUrl: $IPA_URL"
-  else
-    echo "  ⚠️  update.json 没有 ipaUrl —— iOS 端将回退到 GitHub Releases"
-  fi
+  echo "  ✅ dist 里有 IPA，将与 APK 一起推送到 $SERVER_DIR/$SERVER_IPA"
+  echo "     （iOS 端按约定路径取：api/mobile/apk?name=$SERVER_IPA）"
 fi
 if [ "$FAIL" != "0" ]; then
   echo ""
@@ -187,10 +183,13 @@ echo "=== 6. 端到端回验（从公网地址重新下载）==="
 VERIFY_DIR="$DIST_DIR/.verify"
 rm -rf "$VERIFY_DIR"; mkdir -p "$VERIFY_DIR"
 
-curl -fsS --max-time 180 "$PUBLIC_BASE/api/mobile/apk?name=$SERVER_APK" -o "$VERIFY_DIR/dl.apk"
-curl -fsS --max-time 60  "$PUBLIC_BASE/api/mobile/update" -o "$VERIFY_DIR/dl.json"
+# 注意：必须用 shell 重定向（> file）而不是 curl 的 -o。
+# 本机 curl 是 Windows 原生 exe，不认 /c/... 形式的 MSYS 路径，
+# 用 -o 会以 exit 23（client returned ERROR on write）失败。
+curl -fsS --max-time 180 "$PUBLIC_BASE/api/mobile/apk?name=$SERVER_APK" > "$VERIFY_DIR/dl.apk"
+curl -fsS --max-time 60  "$PUBLIC_BASE/api/mobile/update" > "$VERIFY_DIR/dl.json"
 if [ "$HAS_IPA" = "1" ]; then
-  curl -fsS --max-time 180 "$PUBLIC_BASE/api/mobile/apk?name=$SERVER_IPA" -o "$VERIFY_DIR/dl.ipa"
+  curl -fsS --max-time 180 "$PUBLIC_BASE/api/mobile/apk?name=$SERVER_IPA" > "$VERIFY_DIR/dl.ipa"
 fi
 
 OK=1
@@ -214,9 +213,11 @@ if [ "$HAS_IPA" = "1" ]; then
 fi
 
 DL_SHA_DECL=$(json_field "$VERIFY_DIR/dl.json" sha256 | tr 'a-f' 'A-F')
-DL_IPA_URL=$(json_field "$VERIFY_DIR/dl.json" ipaUrl)
-echo "  update 接口: $(json_field "$VERIFY_DIR/dl.json" versionName)  声明 sha256=$DL_SHA_DECL"
-echo "               ipaUrl=$DL_IPA_URL"
+DL_VER=$(json_field "$VERIFY_DIR/dl.json" versionName)
+DL_VCODE=$(sed -n 's/.*"versionCode": *\([0-9][0-9]*\).*/\1/p' "$VERIFY_DIR/dl.json" | head -n1)
+echo "  update 接口: $DL_VER (code $DL_VCODE)  声明 sha256=$DL_SHA_DECL"
+echo "               （服务端会重新序列化 update.json，只回传它认识的字段 ——"
+echo "                 apkName/ipaUrl 这类自定义字段被丢弃属预期，不影响校验）"
 if [ "$DL_SHA_DECL" = "$REAL_SHA" ]; then
   echo "       ✅ 声明的 sha256 与包一致（客户端校验能过）"
 else

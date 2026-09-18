@@ -101,13 +101,16 @@ enum UpdateService {
         let notes = json["notes"] as? String ?? "本次更新包含功能优化和问题修复。"
         let size = (json["size"] as? NSNumber)?.int64Value ?? 0
 
-        // 下载地址优先级：服务端 `ipaUrl` > GitHub Releases。
+        // 下载地址优先级：
+        //   1. 服务端下发的 `ipaUrl`（当前服务端会丢弃该字段，留作将来兼容）
+        //   2. 服务端约定路径 —— IPA 与 APK 同目录、共用 api/mobile/apk 接口
+        //   3. GitHub Releases
         //
-        // 刻意**不**回退到 `apkUrl` —— iOS 装不了 APK，给用户一个 APK 链接毫无意义。
-        // `ipaUrl` 由发布流程写入服务端 update.json，指向服务端自己的 IPA
-        // （同目录下与 APK 一起发布，走服务器比 GitHub 快且在国内可达）。
+        // 刻意**不**回退到 `apkUrl`：iOS 装不了 APK，给用户一个 APK 链接毫无意义。
         let downloadURL: URL
         if let ipa = json["ipaUrl"] as? String, let resolved = URL(string: ipa, relativeTo: baseURL) {
+            downloadURL = resolved
+        } else if let resolved = UpdateService.remoteIPAURL(base: baseURL) {
             downloadURL = resolved
         } else if let resolved = URL(string: JukuConfig.releasesURL) {
             downloadURL = resolved
@@ -128,5 +131,18 @@ enum UpdateService {
     /// 当前安装版本是否落后于服务端。
     static func isNewer(_ update: MobileUpdate) -> Bool {
         update.versionCode > JukuConfig.currentVersionCode
+    }
+
+    /// 按服务端约定拼出 IPA 下载地址：与 APK 共用 `api/mobile/apk`，只换 `name` 参数。
+    ///
+    /// 用相对 base 拼接（与 Android 端 `new URL(new URL(server), "api/mobile/apk")` 一致），
+    /// 这样服务器挂在反向代理子路径下也能工作。
+    static func remoteIPAURL(base: URL) -> URL? {
+        guard let endpoint = URL(string: JukuConfig.apkAPIPath, relativeTo: base),
+              var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        components.queryItems = [URLQueryItem(name: "name", value: JukuConfig.ipaRemoteName)]
+        return components.url
     }
 }

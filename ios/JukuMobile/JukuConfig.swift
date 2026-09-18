@@ -6,8 +6,8 @@ enum JukuConfig {
 
     // MARK: - 版本
 
-    static let currentVersionName = "1.3.4"
-    static let currentVersionCode = 13
+    static let currentVersionName = "1.3.5"
+    static let currentVersionCode = 14
 
     // MARK: - 服务器
 
@@ -39,6 +39,14 @@ enum JukuConfig {
 
     static let updateAPIPath = "api/mobile/update"
     static let apkAPIPath = "api/mobile/apk"
+
+    /// 服务端发布目录里 IPA 的固定文件名（与 APK 同目录、共用同一个下载接口，只是文件名不同）。
+    ///
+    /// 为什么要在客户端硬编码这个名字：实测服务端 `api/mobile/update` 是**它自己重新序列化**的
+    /// —— 它读 `/data/mobile/update.json` 取 `versionCode/versionName/sha256/size/notes`，
+    /// 但**只回传它认识的字段**（`apkUrl` 等），自定义字段（如 `ipaUrl`）会被丢弃。
+    /// 所以 iOS 侧必须自己按约定拼出 IPA 地址，不能依赖服务端下发。
+    static let ipaRemoteName = "juku-mobile-unsigned.ipa"
 
     // MARK: - iOS 更新包来源
 

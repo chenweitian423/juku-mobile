@@ -77,7 +77,9 @@ download_asset() {
   printf '    api 通道失败，回退 %s\n' "$GH_PROXY"
   local url="https://github.com/$REPO/releases/download/$tag/$name"
   for attempt in $(seq 1 "$RETRY"); do
-    if curl -fsSL --max-time 300 "$GH_PROXY/$url" -o "$out" 2>/dev/null; then
+    # 用 shell 重定向而不是 curl 的 -o：本机 curl 是 Windows 原生 exe，
+    # 不认 /c/... 形式的 MSYS 路径，用 -o 会 exit 23。
+    if curl -fsSL --max-time 300 "$GH_PROXY/$url" > "$out" 2>/dev/null; then
       got=$(wc -c < "$out" | tr -d ' ')
       [ "$got" = "$size" ] && return 0
     fi

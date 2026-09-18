@@ -11,6 +11,11 @@ on:
         description: 构建成功后创建/更新 GitHub Release
         type: boolean
         default: true
+      notes:
+        description: 更新说明（写入 update.json 的 notes；留空用默认文案）
+        type: string
+        required: false
+        default: ""
   push:
     branches: [main]
     paths:
@@ -165,11 +170,53 @@ jobs:
             echo "> 服务端 \`api/mobile/update\` 若要推送此版本，需同步 \`versionCode / versionName / sha256 / size\`。"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Generate server update.json
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          APK_SHA256: ${{ steps.apk.outputs.sha256 }}
+          APK_SIZE: ${{ steps.apk.outputs.size }}
+          NOTES_INPUT: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+
+          # AGP 产出的 APK 不可复现（zip 条目时间戳随构建时间变化，
+          # 实测设 SOURCE_DATE_EPOCH 也无效），所以 sha256 每次构建都不同。
+          # 结论：这个值绝不能手工抄写，必须由流水线自己生成。
+          NOTES="$NOTES_INPUT"
+          if [ -z "$NOTES" ]; then
+            NOTES="本次更新包含功能优化和问题修复。"
+          fi
+          PUBLISHED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # 结构对齐服务端 /data/mobile/update.json，apkName 直接用服务端约定名，
+          # 因此这份文件可以整份替换过去，不需要手工改任何字段。
+          # 用 python 生成以免 notes 里的引号/换行破坏 JSON；单行 -c 规避 YAML 缩进。
+          python3 -c "import json,sys;print(json.dumps({'versionCode':int(sys.argv[1]),'versionName':sys.argv[2],'sha256':sys.argv[3],'size':int(sys.argv[4]),'notes':sys.argv[5],'publishedAt':sys.argv[6],'apkName':'juku-mobile.apk'},ensure_ascii=False,indent=2))" \
+            "$VERSION_CODE" "$VERSION_NAME" "$APK_SHA256" "$APK_SIZE" "$NOTES" "$PUBLISHED" \
+            > artifacts/update.json
+
+          echo "--- artifacts/update.json ---"
+          cat artifacts/update.json
+
+          {
+            echo ""
+            echo "#### 服务端 update.json"
+            echo ""
+            echo "可直接整份替换服务端 \`/data/mobile/update.json\`（apkName 已按服务端约定写好）："
+            echo ""
+            echo '```json'
+            cat artifacts/update.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: juku-mobile-${{ steps.version.outputs.name }}-${{ github.run_number }}
-          path: artifacts/*.apk
+          path: |
+            artifacts/*.apk
+            artifacts/update.json
           retention-days: 30
 
       - name: Publish GitHub Release
@@ -199,14 +246,16 @@ jobs:
             "" \
             "安装：手机浏览器直接下载安装，或 \`adb install -r juku-mobile-${VERSION_NAME}.apk\`。" \
             "" \
+            "**附件 \`update.json\` 可直接替换服务端 \`/data/mobile/update.json\`** —— sha256/size 由本次构建产出，无需手工填写。" \
+            "" \
             "> 本包与历史版本同一签名，已安装用户可直接覆盖升级。" \
             > "$RUNNER_TEMP/notes.md"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，覆盖上传产物"
-            gh release upload "$TAG" "$APK" --clobber
+            gh release upload "$TAG" "$APK" artifacts/update.json --clobber
           else
-            gh release create "$TAG" "$APK" \
+            gh release create "$TAG" "$APK" artifacts/update.json \
               --title "果果剧库 ${VERSION_NAME}" \
               --notes-file "$RUNNER_TEMP/notes.md" \
               --latest

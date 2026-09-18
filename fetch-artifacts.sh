@@ -48,10 +48,10 @@ echo "版本: $TAG_NAME"
 echo "输出: $OUT_DIR"
 echo ""
 
-# 列出 apk / ipa 资产（id 用于走 API 下载，name 决定落地文件名）
+# 列出 apk / ipa / update.json 资产（id 用于走 API 下载，name 决定落地文件名）
 ASSETS=$(gh api "$API" --jq '
   .assets[]
-  | select(.name | test("\\.(apk|ipa)$"; "i"))
+  | select(.name | test("\\.(apk|ipa|json)$"; "i"))
   | "\(.id)\t\(.name)\t\(.size)"
 ')
 
@@ -88,7 +88,7 @@ done
 
 echo ""
 echo "=== 产物清单 ==="
-for f in "$OUT_DIR"/*.apk "$OUT_DIR"/*.ipa; do
+for f in "$OUT_DIR"/*.apk "$OUT_DIR"/*.ipa "$OUT_DIR"/*.json; do
   [ -f "$f" ] || continue
   if command -v sha256sum >/dev/null 2>&1; then
     s=$(sha256sum "$f" | cut -d' ' -f1 | tr 'a-f' 'A-F')
@@ -105,7 +105,7 @@ echo "把 APK 的 size / sha256 填进服务端 update.json 才能推送在线�
 if command -v cygpath >/dev/null 2>&1; then
   echo ""
   echo "=== Windows 路径 ==="
-  for f in "$OUT_DIR"/*.apk "$OUT_DIR"/*.ipa; do
+  for f in "$OUT_DIR"/*.apk "$OUT_DIR"/*.ipa "$OUT_DIR"/*.json; do
     [ -f "$f" ] || continue
     cygpath -w "$f"
   done

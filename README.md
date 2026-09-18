@@ -16,6 +16,18 @@
 Android 在推送 `main` 且改动命中 `app/**` 等路径时会自动构建；
 iOS **只支持手动触发**（macOS runner 按 Linux 的 10 倍消耗免费额度）。
 
+## 下载产物到本地
+
+```bash
+./fetch-artifacts.sh          # 取最新 Release
+./fetch-artifacts.sh v1.3.3   # 取指定版本
+```
+
+产物落在 `dist/`（已 gitignore），脚本会校验文件大小并打印完整 sha256。
+
+> 刻意不用 `gh release download` —— 它走 `github.com`，在代理拦截该主站的环境下会
+> **静默失败**（不报错、退出码 0、目标目录却是空的）。脚本改用 `api.github.com` 的 assets API。
+
 ## 版本号
 
 两端版本号必须一致，改动时同步这两处：

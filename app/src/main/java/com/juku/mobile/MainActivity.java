@@ -71,6 +71,8 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
@@ -78,12 +80,13 @@ public class MainActivity extends Activity {
     private static final String PREFS = "juku_mobile";
     private static final String KEY_SERVER_URL = "server_url";
     private static final String KEY_LAST_UPDATE_CHECK = "last_update_check";
+    private static final String KEY_UPDATE_TRACE = "update_trace";
     private static final String KEY_WEB_CACHE_VERSION = "web_cache_version";
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.8";
-    private static final int CURRENT_VERSION_CODE = 17;
+    private static final String CURRENT_VERSION_NAME = "1.3.9";
+    private static final int CURRENT_VERSION_CODE = 18;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final long AUTO_UPDATE_INTERVAL_MS = 12L * 60L * 60L * 1000L;
@@ -123,6 +126,7 @@ public class MainActivity extends Activity {
                     PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
             String message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
             if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                noteUpdateStep("等待系统安装界面确认");
                 Intent confirmation = intent.getParcelableExtra(Intent.EXTRA_INTENT);
                 if (confirmation != null) {
                     confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -133,11 +137,13 @@ public class MainActivity extends Activity {
             if (status == PackageInstaller.STATUS_SUCCESS) {
                 pendingInstallFile = null;
                 clearUpdateCache();
+                noteUpdateStep("安装成功");
                 Toast.makeText(MainActivity.this, "更新安装完成", Toast.LENGTH_SHORT).show();
                 return;
             }
             String detail = message == null || message.trim().isEmpty()
                     ? "系统未返回具体原因" : message.trim();
+            noteUpdateStep("安装失败（" + status + "）：" + detail);
             File failedApk = pendingInstallFile;
             pendingInstallFile = null;
             // 签名冲突类失败无法通过换安装器绕过，直接给出可执行指引，不再降级掩盖原因
@@ -220,6 +226,9 @@ public class MainActivity extends Activity {
         buildContentView();
         registerInstallReceiver();
         configureWebView();
+        // 启动时清掉更新缓存里的历史安装包：既避免旧包被误安装（见 finishDownloadSuccess），
+        // 也避免这些几十 KB 的残留长期占着缓存。
+        removeOtherApks(new File(getCacheDir(), "updates"), null);
         if (savedInstanceState == null || webView.restoreState(savedInstanceState) == null) {
             loadConfiguredServer();
         }
@@ -718,6 +727,27 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * 记录最近一次更新流程的关键步骤（存 SharedPreferences，并在「关于」里展示）。
+     * 手机端出问题时，用户直接截「关于」页就能把现场带出来，不必去翻 logcat
+     * （iOS 压根没有 logcat，部分 ROM 也不好抓）。
+     */
+    private void noteUpdateStep(String step) {
+        Log.i(LOG_TAG, "update: " + step);
+        String stamp = new SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA).format(new Date());
+        String previous = preferences().getString(KEY_UPDATE_TRACE, "");
+        StringBuilder builder = new StringBuilder();
+        if (!previous.trim().isEmpty()) {
+            String[] lines = previous.trim().split("\n");
+            int from = Math.max(0, lines.length - 6);   // 只留最近 7 行，避免无限增长
+            for (int index = from; index < lines.length; index++) {
+                builder.append(lines[index]).append('\n');
+            }
+        }
+        builder.append(stamp).append("  ").append(step);
+        preferences().edit().putString(KEY_UPDATE_TRACE, builder.toString()).apply();
+    }
+
     private String normalizeServerUrl(String raw) {
         String address = raw == null ? "" : raw.trim();
         if (address.isEmpty()) {
@@ -785,6 +815,12 @@ public class MainActivity extends Activity {
             text.append("签名：").append(signature).append("\n");
         }
         text.append("\n点击“检查更新”可立即获取最新版本。");
+
+        // 最近更新记录：手机端出问题时用户直接把这一页截图即可（不必抓 logcat）
+        String trace = preferences().getString(KEY_UPDATE_TRACE, "").trim();
+        if (!trace.isEmpty()) {
+            text.append("\n\n最近更新记录：\n").append(trace);
+        }
 
         TextView view = new TextView(this);
         view.setText(text.toString());
@@ -883,6 +919,8 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 MobileUpdate update = fetchMobileUpdate();
+                noteUpdateStep("检查更新：本地 " + CURRENT_VERSION_NAME + "(" + CURRENT_VERSION_CODE
+                        + ") → 服务器 " + update.versionName + "(" + update.versionCode + ")");
                 runOnUiThread(() -> {
                     updateCheckRunning = false;
                     preferences().edit().putLong(KEY_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply();
@@ -895,6 +933,7 @@ public class MainActivity extends Activity {
                     showUpdatePrompt(update);
                 });
             } catch (Exception error) {
+                noteUpdateStep("检查失败：" + updateError(error));
                 runOnUiThread(() -> {
                     updateCheckRunning = false;
                     if (userInitiated) {
@@ -984,6 +1023,9 @@ public class MainActivity extends Activity {
             return;
         }
         final File target = new File(directory, "juku-mobile-" + update.versionCode + ".apk");
+        // 先把历史残留包清掉，避免旧包被误当成新包安装
+        removeOtherApks(directory, target);
+        noteUpdateStep("开始下载：" + target.getName() + "（目标 " + update.size + " B）");
         downloadCancelled = false;
 
         LinearLayout layout = new LinearLayout(this);
@@ -1033,7 +1075,7 @@ public class MainActivity extends Activity {
             try {
                 boolean ok = downloadUpdateOnce(update, target, attempt);
                 if (ok) {
-                    runOnUiThread(this::finishDownloadSuccess);
+                    runOnUiThread(() -> finishDownloadSuccess(target));
                     return;
                 }
                 if (downloadCancelled) {
@@ -1057,6 +1099,7 @@ public class MainActivity extends Activity {
             }
         }
         final IOException error = lastError;
+        noteUpdateStep("下载失败：" + updateError(error));
         runOnUiThread(() -> {
             if (downloadCancelled) {
                 cancelUpdateNotification();
@@ -1093,6 +1136,7 @@ public class MainActivity extends Activity {
         }
         try {
             int status = connection.getResponseCode();
+            noteUpdateStep("下载响应 HTTP " + status + (resuming ? "，续传自 " + existing + " B" : ""));
             long total;
             long received;
             if (status == HttpURLConnection.HTTP_PARTIAL && resuming) {
@@ -1169,6 +1213,8 @@ public class MainActivity extends Activity {
                 if (!actual.equalsIgnoreCase(update.sha256)) {
                     //noinspection ResultOfMethodCallIgnored
                     target.delete();
+                    noteUpdateStep("校验失败：实际 " + actual.substring(0, Math.min(16, actual.length()))
+                            + "… 期望 " + update.sha256.substring(0, Math.min(16, update.sha256.length())) + "…");
                     if (attempt < MAX_DOWNLOAD_RETRY) {
                         return false; // 让外层重试
                     }
@@ -1188,28 +1234,52 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void finishDownloadSuccess() {
+    /**
+     * 下载完成 → 安装。
+     *
+     * ★ 必须用「刚下载并校验通过的那个文件」，不能再去目录里扫。
+     * 之前的写法是遍历 cache/updates 取**第一个** .apk，而 listFiles() 的顺序是文件系统决定的：
+     * 只要目录里还留着历史残留（例如上一次中断下载留下的 juku-mobile-12.apk），
+     * 就会把那个旧包拿去安装 —— 症状是「下载明明成功，安装却报
+     * 解析软件包时出现问题 / Failed opening content provider，且报错里的文件名是旧版本号」。
+     * 模拟器是干净环境所以复现不出来，用户手机上残留包一多就必然踩中。
+     */
+    private void finishDownloadSuccess(File apk) {
         if (downloadCancelled) {
             return;
         }
         cancelUpdateNotification();
         closeDownloadDialog();
-        File directory = new File(getCacheDir(), "updates");
-        File apk = null;
-        File[] files = directory.listFiles();
-        if (files != null) {
-            for (File file : files) {
-                if (file.isFile() && file.getName().endsWith(".apk")) {
-                    apk = file;
-                    break;
-                }
-            }
-        }
-        if (apk == null) {
+        if (apk == null || !apk.isFile() || apk.length() <= 0L) {
+            noteUpdateStep("下载完成但文件不可用：" + (apk == null ? "(null)" : apk.getName()));
             Toast.makeText(this, "更新文件丢失，请重新下载", Toast.LENGTH_LONG).show();
             return;
         }
+        noteUpdateStep("下载完成：" + apk.getName() + " " + apk.length() + " B");
         installApk(apk);
+    }
+
+    /**
+     * 清掉更新目录里除 keep 之外的安装包。
+     * 两个目的：① 不让历史残留包有机会被安装（见 finishDownloadSuccess 的说明）；
+     * ② 不长期占存储。
+     */
+    private void removeOtherApks(File directory, File keep) {
+        File[] files = directory.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File file : files) {
+            if (!file.isFile() || !file.getName().endsWith(".apk")) {
+                continue;
+            }
+            if (keep != null && file.getAbsolutePath().equals(keep.getAbsolutePath())) {
+                continue;
+            }
+            if (file.delete()) {
+                Log.i(LOG_TAG, "removed stale update file " + file.getName());
+            }
+        }
     }
 
     private long parseContentRangeTotal(String contentRange) {
@@ -1335,14 +1405,17 @@ public class MainActivity extends Activity {
     }
 
     private void installApk(File apk) {
+        noteUpdateStep("开始安装：" + apk.getName() + " " + apk.length() + " B");
         // 预检 1：包本身是否可解析、包名是否匹配
         String localIssue = precheckApk(apk);
         if (localIssue != null) {
+            noteUpdateStep("安装前预检未通过：" + localIssue);
             Toast.makeText(this, "更新包有问题：" + localIssue, Toast.LENGTH_LONG).show();
             return;
         }
         // 预检 2：签名是否与已安装版本一致 —— 不一致时系统必然拒绝，提前给出指引
         if (hasSignatureConflict(apk)) {
+            noteUpdateStep("签名与已安装版本不一致");
             showSignatureConflictGuide(apk);
             return;
         }
@@ -1486,6 +1559,7 @@ public class MainActivity extends Activity {
      * 触发安装器，兼容性明显更好；若系统只有一个安装器入口，行为一致。
      */
     private void installWithViewer(File apk) {
+        noteUpdateStep("改用系统安装器打开：" + apk.getName());
         Uri uri = ApkFileProvider.uriForFile(this, apk);
         String mime = "application/vnd.android.package-archive";
 

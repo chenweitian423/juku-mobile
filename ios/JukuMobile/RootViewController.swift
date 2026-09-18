@@ -261,7 +261,21 @@ final class RootViewController: UIViewController {
         presentShellMenu()
     }
 
-    /// 外壳菜单。原来挂在导航栏按钮上，现在由网页头部的注入按钮触发。
+    /// 处理网页「更多」面板里注入条目的动作（server / update / about）。
+    private func handleNativeAction(_ action: String) {
+        switch action {
+        case "server":
+            presentServerDialog()
+        case "update":
+            checkForUpdate(userInitiated: true)
+        case "about":
+            presentAbout()
+        default:
+            break
+        }
+    }
+
+    /// 外壳菜单。正常走网页「更多」面板里的注入条目，这里只服务兜底悬浮按钮。
     private func presentShellMenu() {
         let sheet = UIAlertController(title: "果果剧库", message: nil, preferredStyle: .actionSheet)
         sheet.addAction(UIAlertAction(title: "服务器地址", style: .default) { [weak self] _ in
@@ -453,10 +467,15 @@ extension RootViewController: WKScriptMessageHandler {
             let hidden = (body["hidden"] as? NSNumber)?.boolValue ?? false
             let landscape = (body["landscape"] as? NSNumber)?.boolValue ?? false
             applyPlayerState(active: active, controlsHidden: hidden, landscape: landscape)
-        case "openMenu":
-            presentShellMenu()
-        case "menuUnavailable":
-            fallbackMenuButton?.isHidden = false
+        case "menu":
+            if let action = body["action"] as? String {
+                handleNativeAction(action)
+            }
+        case "menuEntry":
+            // inpage：网页「更多」面板里已挂上外壳条目，隐藏兜底按钮；
+            // floating：网页没有可用入口（未登录时头部动作区被隐藏，或网页改版），显示兜底按钮。
+            let mode = body["mode"] as? String ?? "floating"
+            fallbackMenuButton?.isHidden = (mode == "inpage")
         case "ready":
             injectShellBridge()
         default:
@@ -661,41 +680,87 @@ extension RootViewController {
               });
             } catch (e) {}
           };
-          window.JukuShell.openMenu = function(){
-            try { window.webkit.messageHandlers.\(JukuConfig.shellHandlerName).postMessage({ type: 'openMenu' }); } catch (e) {}
+          window.JukuShell.nativeAction = function(action){
+            try {
+              window.webkit.messageHandlers.\(JukuConfig.shellHandlerName).postMessage({
+                type: 'menu',
+                action: String(action)
+              });
+            } catch (e) {}
           };
-          window.JukuShell.menuButtonUnavailable = function(){
-            try { window.webkit.messageHandlers.\(JukuConfig.shellHandlerName).postMessage({ type: 'menuUnavailable' }); } catch (e) {}
+          window.JukuShell.setMenuEntry = function(mode){
+            try {
+              window.webkit.messageHandlers.\(JukuConfig.shellHandlerName).postMessage({
+                type: 'menuEntry',
+                mode: String(mode)
+              });
+            } catch (e) {}
           };
-          // 菜单按钮注入：网页自己的 .app-header 里已有 .header-actions，
-          // 在那里插一个同款按钮，就不需要原生导航栏（避免重复占一行）。
+          // 菜单条目注入：直接挂进网页自己的「更多」面板（#morePanel），
+          // 不再额外加一个 header 按钮 —— 那样会出现两个「⋯」。
           // 这段必须放在 __jukuShellBridgeInstalled 短路之前 —— SPA 会重建头部 DOM，
-          // 每次页面加载都要重新注入。
-          var jukuInstallMenu = function(){
-            var actions = document.querySelector('.app-header .header-actions');
-            if (!actions) { return false; }
-            if (actions.querySelector('.juku-shell-menu')) { return true; }
-            var btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'icon-button juku-shell-menu';
-            btn.setAttribute('aria-label', '更多设置');
-            btn.title = '更多设置';
-            btn.textContent = '\\u22EF';
-            btn.addEventListener('click', function(e){
-              e.preventDefault(); e.stopPropagation();
-              window.JukuShell.openMenu();
-            });
-            actions.insertBefore(btn, actions.firstChild);
+          // 登录状态变化也会隐藏/显示入口，所以靠定时器持续校正。
+          var jukuInjectMenu = function(){
+            var panel = document.getElementById('morePanel');
+            if (!panel) { return false; }
+            if (panel.querySelector('[data-juku-action]')) { return true; }
+            var anchor = panel.querySelector('#libraryMenuUpdatedAt');
+            var label = document.createElement('span');
+            label.className = 'small';
+            label.textContent = '客户端';
+            if (anchor) { panel.insertBefore(label, anchor); } else { panel.appendChild(label); }
+            var items = [['server', '服务器地址'], ['update', '检查更新'], ['about', '关于']];
+            for (var i = 0; i < items.length; i++) {
+              var key = items[i][0], text = items[i][1];
+              var btn = document.createElement('button');
+              btn.type = 'button';
+              btn.setAttribute('data-juku-action', key);
+              btn.textContent = text;
+              btn.addEventListener('click', function(e){
+                e.preventDefault(); e.stopPropagation();
+                var details = document.getElementById('headerMenu');
+                if (details) { details.open = false; }
+                window.JukuShell.nativeAction(this.getAttribute('data-juku-action'));
+              });
+              if (anchor) { panel.insertBefore(btn, anchor); } else { panel.appendChild(btn); }
+            }
             return true;
           };
-          var jukuMenuTries = 0;
-          var jukuMenuTimer = setInterval(function(){
-            jukuMenuTries++;
-            if (jukuInstallMenu() || jukuMenuTries > 20) {
-              clearInterval(jukuMenuTimer);
-              if (!jukuInstallMenu()) { window.JukuShell.menuButtonUnavailable(); }
+          var jukuLastMode = '';
+          var jukuReportMenu = function(){
+            var ok = false;
+            try { ok = jukuInjectMenu(); } catch (e) { ok = false; }
+            var visible = false;
+            try {
+              var s = document.getElementById('moreButton');
+              visible = !!(s && s.offsetParent !== null && getComputedStyle(s).display !== 'none');
+            } catch (e) {}
+            var mode = (ok && visible) ? 'inpage' : 'floating';
+            if (mode !== jukuLastMode) {
+              jukuLastMode = mode;
+              try {
+                console.log('[juku] menu mode=' + mode + ' items=' +
+                  document.querySelectorAll('#morePanel [data-juku-action]').length);
+              } catch (e) {}
+              window.JukuShell.setMenuEntry(mode);
             }
-          }, 500);
+          };
+          setInterval(jukuReportMenu, 1500);
+          jukuReportMenu();
+          // 自动旋转默认关闭：网页的「自动旋转」读的是设备方向传感器
+          // （player-orientation.js 里 localStorage 的 juku.playback.autoRotate，默认 true），
+          // 跟系统「方向锁定」无关，所以手机横过来播放器就会自己转。
+          // 只在用户从未设置过时改成 false，之后他仍可在播放器里自己勾回来。
+          try {
+            if (localStorage.getItem('juku.playback.autoRotate') === null) {
+              localStorage.setItem('juku.playback.autoRotate', 'false');
+              var autoBox = document.getElementById('mobileAutoRotate');
+              if (autoBox && autoBox.checked) {
+                autoBox.checked = false;
+                autoBox.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }
+          } catch (e) {}
           if (window.__jukuShellBridgeInstalled) { return; }
           window.__jukuShellBridgeInstalled = true;
           var sync = function(){

@@ -19,8 +19,8 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
-import android.net.Uri;
-import android.os.Build;
+import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -28,12 +28,15 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.text.InputType;
 import android.text.method.LinkMovementMethod;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
+import android.webkit.ConsoleMessage;
 import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
@@ -49,7 +52,6 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -72,6 +74,7 @@ import java.security.MessageDigest;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
+    private static final String LOG_TAG = "JukuMobile";
     private static final String PREFS = "juku_mobile";
     private static final String KEY_SERVER_URL = "server_url";
     private static final String KEY_LAST_UPDATE_CHECK = "last_update_check";
@@ -79,19 +82,19 @@ public class MainActivity extends Activity {
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.6";
-    private static final int CURRENT_VERSION_CODE = 15;
+    private static final String CURRENT_VERSION_NAME = "1.3.7";
+    private static final int CURRENT_VERSION_CODE = 16;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final long AUTO_UPDATE_INTERVAL_MS = 12L * 60L * 60L * 1000L;
     private static final long MIN_FOREGROUND_RECHECK_MS = 30L * 60L * 1000L;
 
-    private static final String NOTIFICATION_CHANNEL_ID = "juku_update";
-    private static final int NOTIFICATION_ID_UPDATE = 0x4A55; // "JU"
+    private static final String NOTIFICATION_CHANNEL_ID = "juku_update";    private static final int NOTIFICATION_ID_UPDATE = 0x4A55; // "JU"
     private static final int MAX_DOWNLOAD_RETRY = 2;
 
     private FrameLayout contentRoot;
-    private ImageButton fallbackMenuButton;
+    private TextView fallbackMenuButton;
+    private boolean immersiveNow;
     private WebView webView;
     private ProgressBar progressBar;
     private TextView errorView;
@@ -167,22 +170,48 @@ public class MainActivity extends Activity {
             runOnUiThread(() -> syncImmersiveMode(active, controlsHidden));
         }
 
-        /** 注入到网页头部的菜单按钮被点击时调用。 */
+        /** 网页「更多」面板里注入的外壳条目被点击时调用：server / update / about。 */
         @JavascriptInterface
-        public void openMenu() {
-            runOnUiThread(MainActivity.this::showShellMenu);
+        public void nativeAction(String action) {
+            runOnUiThread(() -> handleNativeAction(action));
         }
 
-        /** 注入失败（网页没有预期的头部结构）时调用，退回到原生悬浮按钮。 */
+        /**
+         * 网页上报「菜单入口是否可用」：
+         * inpage   —— 网页顶部的「更多」按钮可见，外壳条目已挂在它的面板里，隐藏兜底按钮；
+         * floating —— 网页没有这个入口（未登录时头部动作区被隐藏，或网页改版），
+         *             显示兜底悬浮按钮，保证「服务器地址」这类唯一入口永远可达。
+         */
         @JavascriptInterface
-        public void menuButtonUnavailable() {
+        public void setMenuEntry(String mode) {
             runOnUiThread(() -> {
                 if (fallbackMenuButton != null) {
-                    fallbackMenuButton.setVisibility(View.VISIBLE);
+                    fallbackMenuButton.setVisibility("inpage".equals(mode) ? View.GONE : View.VISIBLE);
                 }
             });
         }
     }
+
+    /** 处理网页里注入条目的动作。 */
+    private void handleNativeAction(String action) {
+        if (action == null) {
+            return;
+        }
+        switch (action) {
+            case "server":
+                showServerDialog();
+                break;
+            case "update":
+                checkForUpdate(true);
+                break;
+            case "about":
+                showAboutDialog();
+                break;
+            default:
+                break;
+        }
+    }
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -204,6 +233,27 @@ public class MainActivity extends Activity {
     private void buildContentView() {
         contentRoot = new FrameLayout(this);
         contentRoot.setBackgroundColor(Color.rgb(15, 17, 21));
+
+        // 顶部安全区由外壳补：网页只处理了底部 safe-area（app.css 里 5 处
+        // env(safe-area-inset-bottom)），顶部没有任何处理。
+        // Android 15 起 targetSdk 35 走 edge-to-edge，内容默认绘制到状态栏下面，
+        // 网页顶栏会被状态栏压掉半行且拉不出来。这里按实际 inset 下移内容。
+        // 沉浸（全屏播放）时不留白，否则播放器会被顶出一条黑边。
+        contentRoot.setOnApplyWindowInsetsListener((view, insets) -> {
+            int top;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                top = insets.getInsets(WindowInsets.Type.statusBars()).top;
+            } else {
+                top = insets.getSystemWindowInsetTop();
+            }
+            if (immersiveNow) {
+                top = 0;
+            }
+            if (view.getPaddingTop() != top) {
+                view.setPadding(0, top, 0, 0);
+            }
+            return insets;
+        });
 
         webView = new WebView(this);
         contentRoot.addView(webView, new FrameLayout.LayoutParams(
@@ -241,21 +291,31 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 兜底菜单入口：默认隐藏，只有当注入到网页头部的按钮装不上时
-     * （网页结构变了、或还没加载完）才显示，保证菜单永远可达。
+     * 兜底菜单入口：只有网页里没有可用的「更多」按钮时才显示
+     * （未登录时网页会隐藏头部动作区，或网页改版），保证「服务器地址」等入口永远可达。
      */
     private void installFallbackMenuButton() {
-        fallbackMenuButton = new ImageButton(this);
-        fallbackMenuButton.setImageResource(android.R.drawable.ic_menu_more);
-        fallbackMenuButton.setBackgroundColor(Color.argb(150, 15, 17, 21));
-        fallbackMenuButton.setContentDescription("更多设置");
-        fallbackMenuButton.setVisibility(View.GONE);
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(40), dp(40));
+        // 用文字「⋯」自绘，不用系统图标 —— android.R.drawable.ic_menu_more
+        // 在各版本上长得像「下载」，容易被误认。
+        TextView button = new TextView(this);
+        button.setText("⋯");
+        button.setTextColor(Color.WHITE);
+        button.setTextSize(20);
+        button.setGravity(Gravity.CENTER);
+        GradientDrawable background = new GradientDrawable();
+        background.setShape(GradientDrawable.OVAL);
+        background.setColor(Color.argb(205, 20, 24, 31));
+        background.setStroke(dp(1), Color.argb(80, 255, 255, 255));
+        button.setBackground(background);
+        button.setContentDescription("更多设置");
+        button.setVisibility(View.GONE);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(38), dp(38));
         params.gravity = Gravity.TOP | Gravity.END;
-        params.topMargin = dp(6);
-        params.rightMargin = dp(6);
-        fallbackMenuButton.setOnClickListener(view -> showShellMenu());
-        contentRoot.addView(fallbackMenuButton, params);
+        params.topMargin = dp(10);
+        params.rightMargin = dp(10);
+        button.setOnClickListener(view -> showShellMenu());
+        fallbackMenuButton = button;
+        contentRoot.addView(button, params);
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -333,6 +393,20 @@ public class MainActivity extends Activity {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
                 progressBar.setProgress(newProgress);
+            }
+
+            /**
+             * 只把外壳自己打的日志（以 [juku] 开头）转到 logcat，
+             * 便于定位「菜单条目注入是否成功」这类网页侧问题：
+             *   adb logcat -s JukuMobile
+             */
+            @Override
+            public boolean onConsoleMessage(ConsoleMessage message) {
+                if (message != null && message.message() != null
+                        && message.message().startsWith("[juku]")) {
+                    Log.i(LOG_TAG, "js " + message.message());
+                }
+                return true;
             }
 
             @Override
@@ -435,32 +509,59 @@ public class MainActivity extends Activity {
 
     private void installShellBridge() {
         String script = "(function(){"
-                // 菜单按钮注入：网页自己的 .app-header 里已有 .header-actions，
-                // 在那里插一个同款图标按钮，就不再需要原生 ActionBar（避免重复占一行）。
-                // 这段必须放在 __jukuShellBridgeInstalled 短路之前 —— SPA 切换会重建头部 DOM，
-                // 每次页面加载都要重新注入。
-                + "var installMenu=function(){"
-                + "var actions=document.querySelector('.app-header .header-actions');"
-                + "if(!actions){return false;}"
-                + "if(actions.querySelector('.juku-shell-menu')){return true;}"
-                + "var btn=document.createElement('button');"
-                + "btn.type='button';"
-                + "btn.className='icon-button juku-shell-menu';"
-                + "btn.setAttribute('aria-label','更多设置');"
-                + "btn.title='更多设置';"
-                + "btn.textContent='\\u22EF';"
-                + "btn.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();"
-                + "try{JukuShell.openMenu();}catch(err){}});"
-                + "actions.insertBefore(btn,actions.firstChild);"
+                // 菜单条目注入：直接挂进网页自己的「更多」面板（#morePanel），
+                // 不再额外加一个 header 按钮 —— 那样会出现两个「⋯」，而且原生
+                // AlertDialog 在部分 ROM 上是浅色，弹出来很突兀。
+                // 放在 __jukuShellBridgeInstalled 短路之前：SPA 切换、登录状态变化都会
+                // 重建头部 DOM，所以要靠定时器持续校正。
+                + "var injectMenu=function(){"
+                + "var panel=document.getElementById('morePanel');"
+                + "if(!panel){return false;}"
+                + "if(panel.querySelector('[data-juku-action]')){return true;}"
+                + "var anchor=panel.querySelector('#libraryMenuUpdatedAt');"
+                + "var label=document.createElement('span');"
+                + "label.className='small';"
+                + "label.textContent='客户端';"
+                + "if(anchor){panel.insertBefore(label,anchor);}else{panel.appendChild(label);}"
+                + "var items=[['server','服务器地址'],['update','检查更新'],['about','关于']];"
+                + "for(var i=0;i<items.length;i++){"
+                + "var key=items[i][0],text=items[i][1];"
+                + "var b=document.createElement('button');"
+                + "b.type='button';"
+                + "b.setAttribute('data-juku-action',key);"
+                + "b.textContent=text;"
+                + "b.addEventListener('click',function(e){"
+                + "e.preventDefault();e.stopPropagation();"
+                + "var d=document.getElementById('headerMenu');if(d){d.open=false;}"
+                + "try{JukuShell.nativeAction(this.getAttribute('data-juku-action'));}catch(err){}});"
+                + "if(anchor){panel.insertBefore(b,anchor);}else{panel.appendChild(b);}}"
                 + "return true;};"
-                + "var menuTries=0;"
-                + "var menuTimer=setInterval(function(){"
-                + "menuTries++;"
-                + "if(installMenu()||menuTries>20){"
-                + "clearInterval(menuTimer);"
-                // 20 次（10 秒）都装不上 => 网页结构变了，退回到原生悬浮按钮，保证菜单可达
-                + "if(!installMenu()){try{JukuShell.menuButtonUnavailable();}catch(err){}}"
-                + "}},500);"
+                + "var lastMode='';"
+                + "var reportMenu=function(){"
+                + "var ok=false;"
+                + "try{ok=injectMenu();}catch(e){ok=false;}"
+                + "var visible=false;"
+                + "try{var s=document.getElementById('moreButton');"
+                + "visible=!!(s&&s.offsetParent!==null&&getComputedStyle(s).display!=='none');}catch(e){}"
+                // 必须「条目真的注入了」且「网页入口可见」才算页内菜单可用；
+                // 任一不成立都退回原生兜底按钮，避免完全够不到服务器地址。
+                + "var mode=(ok&&visible)?'inpage':'floating';"
+                + "if(mode!==lastMode){lastMode=mode;"
+                + "try{console.log('[juku] menu mode='+mode+' items='+document.querySelectorAll('#morePanel [data-juku-action]').length);}catch(e){}"
+                + "try{JukuShell.setMenuEntry(mode);}catch(e){}}"
+                + "};"
+                + "setInterval(reportMenu,1500);"
+                + "reportMenu();"
+                // 自动旋转默认关闭：网页的「自动旋转」读的是设备方向传感器
+                // （player-orientation.js 里 localStorage 的 juku.playback.autoRotate，默认 true），
+                // 跟系统「方向锁定」无关，所以手机横过来播放器就会自己转。
+                // 只在用户从未设置过时改成 false，之后他仍可在播放器里自己勾回来。
+                + "try{"
+                + "if(localStorage.getItem('juku.playback.autoRotate')===null){"
+                + "localStorage.setItem('juku.playback.autoRotate','false');"
+                + "var cb=document.getElementById('mobileAutoRotate');"
+                + "if(cb&&cb.checked){cb.checked=false;cb.dispatchEvent(new Event('change',{bubbles:true}));}"
+                + "}}catch(e){}"
                 + "if(window.__jukuShellBridgeInstalled){return;}"
                 + "window.__jukuShellBridgeInstalled=true;"
                 + "var sync=function(){"
@@ -494,13 +595,13 @@ public class MainActivity extends Activity {
         applyImmersiveMode(playerActive && controlsHidden);
     }
 
-    /** 外壳菜单。原来挂在 ActionBar 上，现在由网页头部的注入按钮触发。 */
+    /** 外壳菜单。正常情况走网页「更多」面板里的注入条目，这里只服务兜底悬浮按钮。 */
     private void showShellMenu() {
         if (isFinishing()) {
             return;
         }
         String[] items = {"服务器地址", "刷新", "检查更新", "回到首页", "关于"};
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                 .setTitle(R.string.app_name)
                 .setItems(items, (dialog, which) -> {
                     switch (which) {
@@ -583,6 +684,9 @@ public class MainActivity extends Activity {
         input.setSingleLine(true);
         input.setText(preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL));
         input.setSelectAllOnFocus(true);
+        // 主题已是深色，但输入框文字/光标要显式指定，否则个别 ROM 上会出现白底白字。
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(Color.parseColor("#7C838E"));
         int padding = dp(22);
         FrameLayout wrapper = new FrameLayout(this);
         wrapper.setPadding(padding, dp(8), padding, 0);
@@ -590,7 +694,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        AlertDialog dialog = new AlertDialog.Builder(this)
+        AlertDialog dialog = new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                 .setTitle("服务器地址")
                 .setMessage("例如 http://192.168.123.121:8999/")
                 .setView(wrapper)
@@ -640,7 +744,7 @@ public class MainActivity extends Activity {
         ScrollView scroll = new ScrollView(this);
         scroll.addView(view);
 
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                 .setTitle("关于")
                 .setView(scroll)
                 .setPositiveButton("检查更新", (dialog, which) -> checkForUpdate(true))
@@ -807,7 +911,7 @@ public class MainActivity extends Activity {
         String message = "当前版本：" + CURRENT_VERSION_NAME + "\n"
                 + "最新版本：" + update.versionName + "（" + size + "）\n\n"
                 + update.notes;
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                 .setTitle("发现手机版更新")
                 .setMessage(message)
                 .setPositiveButton("下载并安装", (dialog, which) -> downloadAndInstall(update))
@@ -845,7 +949,7 @@ public class MainActivity extends Activity {
         progressParams.topMargin = dp(14);
         layout.addView(downloadProgress, progressParams);
 
-        downloadDialog = new AlertDialog.Builder(this)
+        downloadDialog = new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                 .setTitle("正在下载更新")
                 .setView(layout)
                 .setNegativeButton("取消", null)
@@ -1191,7 +1295,7 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 && !getPackageManager().canRequestPackageInstalls()) {
             pendingInstallFile = apk;
-            new AlertDialog.Builder(this)
+            new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                     .setTitle("需要安装权限")
                     .setMessage("请允许“果果剧库”安装应用，返回后会自动继续安装。")
                     .setPositiveButton("去开启", (dialog, which) -> {
@@ -1402,7 +1506,7 @@ public class MainActivity extends Activity {
                 .append("1. 卸载当前 App 后重新安装新版本（会清空本地设置）\n")
                 .append("2. 到浏览器打开下载页下载最新安装包手动安装\n")
                 .append("3. 确认新版本是用同一签名证书打包后重新发布");
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.JukuDialogTheme)
                 .setTitle("无法覆盖安装")
                 .setMessage(text.toString())
                 .setPositiveButton("知道了", null)
@@ -1495,6 +1599,7 @@ public class MainActivity extends Activity {
     }
 
     private void applyImmersiveMode(boolean enabled) {
+        immersiveNow = enabled;
         if (enabled) {
             getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
             getWindow().getDecorView().setSystemUiVisibility(
@@ -1506,7 +1611,16 @@ public class MainActivity extends Activity {
                             | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
         } else {
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            // 关键：必须把 LAYOUT_FULLSCREEN / LAYOUT_HIDE_NAVIGATION 一并清掉。
+            // 只 clearFlags 而不重置 systemUiVisibility 的话，窗口会一直认为「内容要绘制到
+            // 状态栏下面」：退出全屏回到竖屏浏览时，网页顶栏（.app-header）会被状态栏压住
+            // 半行，而且因为已经在滚动顶部、怎么上滑都拉不出来 —— 只能重启进程才恢复。
+            // 这是用户反馈「竖屏浏览时顶部卡死上不去，重启后正常」的直接原因。
+            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
             configureWindow();
+        }
+        if (contentRoot != null) {
+            contentRoot.requestApplyInsets();
         }
     }
 

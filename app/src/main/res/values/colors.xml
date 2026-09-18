@@ -2,4 +2,7 @@
 <resources>
     <color name="app_background">#0F1115</color>
     <color name="brand_orange">#F05A28</color>
+    <!-- 原生对话框面板色：与网页侧栏底色接近，避免弹出白框 -->
+    <color name="dialog_surface">#14181F</color>
+    <color name="dialog_stroke">#2A2F38</color>
 </resources>

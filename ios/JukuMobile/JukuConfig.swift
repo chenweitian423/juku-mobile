@@ -6,8 +6,8 @@ enum JukuConfig {
 
     // MARK: - 版本
 
-    static let currentVersionName = "1.3.6"
-    static let currentVersionCode = 15
+    static let currentVersionName = "1.3.7"
+    static let currentVersionCode = 16
 
     // MARK: - 服务器
 

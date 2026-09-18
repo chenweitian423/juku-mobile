@@ -2,7 +2,7 @@
 <resources>
     <!-- 用 NoActionBar：网页自己的 .app-header 已经有品牌名与菜单，
          原生 ActionBar 再显示一遍「果果剧库」会重复占掉一整行，把内容压下去。
-         外壳菜单改由注入到网页头部的按钮触发（见 MainActivity 的 installShellBridge）。 -->
+         外壳菜单改由注入到网页「更多」面板里的条目触发（见 MainActivity 的 installShellBridge）。 -->
     <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:windowActionModeOverlay">true</item>
@@ -11,5 +11,18 @@
         <item name="android:statusBarColor">@color/app_background</item>
         <item name="android:navigationBarColor">@color/app_background</item>
         <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <!-- 原生对话框（服务器地址 / 关于 / 兜底菜单）。
+         必须显式锁成深色：部分厂商 ROM 会把 Material 的对话框覆写成浅色，
+         弹出「白框」与网页的深色界面完全不搭。 -->
+    <style name="JukuDialogTheme" parent="@android:style/Theme.Material.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/dialog_background</item>
+        <item name="android:colorAccent">@color/brand_orange</item>
+        <item name="android:textColorPrimary">@android:color/white</item>
+        <item name="android:textColorSecondary">#FFB6BBC4</item>
+        <item name="android:textColorTertiary">#FFB6BBC4</item>
+        <item name="android:textColorHint">#FF7C838E</item>
+        <item name="android:colorBackground">@color/dialog_surface</item>
     </style>
 </resources>

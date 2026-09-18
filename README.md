@@ -114,13 +114,32 @@ CI 在出包后会断言证书指纹等于 `b23d08d3e4e21b051ecc09e8277b669d8b60
 |---|---|---|
 | 检查更新 | 请求同一接口 | 请求同一接口 |
 | 下载 | 应用内下载 + 断点续传 | 优先服务端 IPA，回退 GitHub Releases |
-| 安装 | `ACTION_VIEW` 交给系统安装器，支持应用内直接升级 | **不允许**应用自行安装，需用 AltStore / Sideloadly / TrollStore 自签 |
+| 安装 | `ACTION_VIEW` 交给系统安装器，支持应用内直接升级 | **不允许**应用自行安装，走 AltStore 源更新（见下）
 
 iOS 的下载地址按**服务端约定**拼（`api/mobile/apk?name=juku-mobile-unsigned.ipa`），
 而不是读服务端下发的字段 —— 实测服务端 `api/mobile/update` 会**重新序列化** `update.json`，
 只回传它认识的字段（`apkUrl` / `versionCode` / `sha256` …），自定义字段（如 `ipaUrl`）会被丢弃。
 
 签名一致时 Android 可长期走应用内覆盖升级；一旦换钥匙，老用户必须先卸载再装。
+
+### iOS：用 AltStore 源更新（推荐）
+
+iOS 不允许应用自装，能做到的「在线更新」= **AltStore 源**。发布脚本每次都会把
+`juku-altstore.json` 一起推到服务器，源地址固定不变：
+
+```
+https://duanju.sky423.cn:18888/api/mobile/apk?name=juku-altstore.json
+```
+
+在手机上 **AltStore → Sources → + 粘贴上面的地址**，之后「果果剧库」就会出现在
+AltStore 的 Browse 里；有新版本时点一下即可安装（AltStore 用你的 Apple ID 重签）。
+
+源文件里的版本号 / IPA 大小 / 下载地址全部由 `update.json` 与 IPA 实体推导
+（见 `publish-to-server.sh` 第 3 步），不要手写。
+
+两点平台限制：
+- 免费 Apple ID 签名的应用 **7 天过期**，需要 AltStore 配 AltServer 定期续签（同一 Wi-Fi 自动续）。
+- 图标走 `api/mobile/apk?name=juku-icon.png`（就是 App 图标），AltStore 直接取用。
 
 ## 目录结构
 

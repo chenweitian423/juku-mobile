@@ -6,7 +6,9 @@
     <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:windowActionModeOverlay">true</item>
-        <item name="android:windowBackground">@color/app_background</item>
+        <!-- 冷启动窗口背景 = 启动图（深色底 + 居中品牌图标），
+             见 drawable/splash_background.xml。 -->
+        <item name="android:windowBackground">@drawable/splash_background</item>
         <item name="android:colorAccent">@color/brand_orange</item>
         <item name="android:statusBarColor">@color/app_background</item>
         <item name="android:navigationBarColor">@color/app_background</item>

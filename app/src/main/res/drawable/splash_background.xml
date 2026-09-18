@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  冷启动时的窗口背景（相当于启动图）。
+  WebView 从进程启动到首屏渲染有几秒空档，原来只有一块纯黑，用户会觉得"没反应"；
+  这里放一个居中的品牌图标，让等待期看起来是在加载。
+  setContentView 一执行就会被替换掉，不需要额外的延迟/动画逻辑。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/app_background" />
+    <item
+        android:drawable="@drawable/ic_launcher_foreground"
+        android:gravity="center"
+        android:width="132dp"
+        android:height="132dp" />
+</layer-list>

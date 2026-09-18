@@ -12,6 +12,7 @@ import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -21,6 +22,9 @@ import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkRequest;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -84,11 +88,12 @@ public class MainActivity extends Activity {
     private static final String KEY_LAST_UPDATE_CHECK = "last_update_check";
     private static final String KEY_UPDATE_TRACE = "update_trace";
     private static final String KEY_WEB_CACHE_VERSION = "web_cache_version";
+    private static final String KEY_NOTIFICATION_ASKED = "notification_permission_asked";
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.12";
-    private static final int CURRENT_VERSION_CODE = 21;
+    private static final String CURRENT_VERSION_NAME = "1.3.13";
+    private static final int CURRENT_VERSION_CODE = 22;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1003;
@@ -129,6 +134,8 @@ public class MainActivity extends Activity {
     private boolean webViewPaused;
     private boolean pageLoadSettled = true;
     private int pageLoadWatchdogRounds;
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private boolean notificationPermissionAsked;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
@@ -151,7 +158,7 @@ public class MainActivity extends Activity {
                 mainHandler.postDelayed(this, PAGE_LOAD_WATCHDOG_MS);
                 return;
             }
-            showError("页面加载超时\n\n服务器响应太慢或网络不稳定，请检查网络后重试。\n点此重新加载");
+            showError("页面加载超时\n\n服务器响应太慢或网络不稳定。");
         }
     };
 
@@ -274,6 +281,7 @@ public class MainActivity extends Activity {
         buildContentView();
         registerInstallReceiver();
         configureWebView();
+        registerNetworkRecovery();
         // 启动时回收「一天前」的残留安装包。★ 这里刻意只删过期的、绝不清空目录：
         // 下载完成 → 拉起系统安装器 → 厂商扫描/用户确认可能耗时较长，期间若本 Activity
         // 被重建（配置变化、安装器切换任务栈等），清空目录会把**正在安装的那个包删掉**，
@@ -442,14 +450,16 @@ public class MainActivity extends Activity {
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 if (request.isForMainFrame()) {
                     showError("无法连接服务器\n\n" + error.getDescription()
-                            + "\n\n请检查手机网络，或从右上角菜单检查服务器地址。\n点此重试");
+                            + "\n\n请检查手机网络是否正常；"
+                            + "也可以在浏览器里打开下面的地址确认服务器是否可达。");
                 }
             }
 
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler handler, android.net.http.SslError error) {
                 handler.cancel();
-                showError("HTTPS 证书校验失败，请在菜单中检查服务器地址。");
+                showError("HTTPS 证书校验失败\n\n请点右上角「⋯」→「服务器地址」，"
+                        + "确认地址与证书是否匹配。");
             }
 
             @Override
@@ -800,6 +810,14 @@ public class MainActivity extends Activity {
                 == PackageManager.PERMISSION_GRANTED) {
             return;
         }
+        // 只问一次：被拒绝后再调用 requestPermissions，系统会直接回调 denied 而不弹窗
+        // （Android 的"不再询问"机制），每次都调只会白白多走一轮 IPC 并写脏更新记录。
+        if (notificationPermissionAsked
+                || preferences().getBoolean(KEY_NOTIFICATION_ASKED, false)) {
+            return;
+        }
+        notificationPermissionAsked = true;
+        preferences().edit().putBoolean(KEY_NOTIFICATION_ASKED, true).apply();
         requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},
                 NOTIFICATION_PERMISSION_REQUEST);
     }
@@ -955,15 +973,19 @@ public class MainActivity extends Activity {
     private void showAboutDialog() {
         String server = normalizeServerUrl(preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL));
         String signature = describeSignature();
+        String downloadUrl = server + "api/mobile/apk?name=juku-mobile.apk";
         StringBuilder text = new StringBuilder()
                 .append("应用：果果剧库 手机版\n")
                 .append("版本：").append(CURRENT_VERSION_NAME)
                 .append("（versionCode ").append(CURRENT_VERSION_CODE).append("）\n")
-                .append("服务器：").append(server).append("\n");
+                .append("服务器：").append(server).append("\n")
+                .append("设备：").append(describeDevice()).append("\n");
         if (signature != null) {
             text.append("签名：").append(signature).append("\n");
         }
-        text.append("\n点击“检查更新”可立即获取最新版本。");
+        text.append("\n点击“检查更新”可立即获取最新版本。")
+                .append("\n若自动更新装不上，可复制下面这行到浏览器下载安装：\n")
+                .append(downloadUrl);
 
         // 最近更新记录：手机端出问题时用户直接把这一页截图即可（不必抓 logcat）
         String trace = preferences().getString(KEY_UPDATE_TRACE, "").trim();
@@ -971,8 +993,9 @@ public class MainActivity extends Activity {
             text.append("\n\n最近更新记录：\n").append(trace);
         }
 
+        final String diagnostics = text.toString();
         TextView view = new TextView(this);
-        view.setText(text.toString());
+        view.setText(diagnostics);
         view.setTextColor(Color.WHITE);
         view.setTextSize(14);
         view.setLineSpacing(dp(4), 1.0f);
@@ -987,8 +1010,30 @@ public class MainActivity extends Activity {
                 .setTitle("关于")
                 .setView(scroll)
                 .setPositiveButton("检查更新", (dialog, which) -> checkForUpdate(true))
+                .setNeutralButton("复制信息", (dialog, which) -> copyDiagnostics(diagnostics))
                 .setNegativeButton("关闭", null)
                 .show();
+    }
+
+    /** 设备与系统版本：排查"只在某类手机上出问题"时第一时间要看的信息。 */
+    private String describeDevice() {
+        return Build.MANUFACTURER + " " + Build.MODEL
+                + " / Android " + Build.VERSION.RELEASE
+                + "（API " + Build.VERSION.SDK_INT + "）";
+    }
+
+    /** 把「关于」页的内容整段复制到剪贴板，用户可一键粘贴发出来。 */
+    private void copyDiagnostics(String text) {
+        try {
+            ClipboardManager manager = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (manager == null) {
+                return;
+            }
+            manager.setPrimaryClip(ClipData.newPlainText("果果剧库诊断信息", text));
+            Toast.makeText(this, "已复制，可直接粘贴发送", Toast.LENGTH_SHORT).show();
+        } catch (Exception error) {
+            Toast.makeText(this, "复制失败，请手动选择文本", Toast.LENGTH_SHORT).show();
+        }
     }
 
     /** 读取当前安装包的签名摘要（SHA-256 前 16 位），用于确认签名身份是否一致。 */
@@ -1920,10 +1965,64 @@ public class MainActivity extends Activity {
         URL apkUrl;
     }
 
+    /**
+     * 网络恢复时自动重试。
+     *
+     * 原来的错误页只有"点一下重试"，用户在地铁/电梯里断了网、出来后有网了，
+     * 还得手动点一次才知道能用了。这里监听默认网络的变化，只要**当前正显示错误页**
+     * 就自动重新加载（页面正常时什么都不做，不会打断正在播的视频）。
+     */
+    private void registerNetworkRecovery() {
+        ConnectivityManager manager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (manager == null) {
+            return;
+        }
+        networkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(Network network) {
+                mainHandler.post(() -> {
+                    if (isFinishing() || !showingError || webView == null) {
+                        return;
+                    }
+                    Toast.makeText(MainActivity.this, "网络已恢复，正在重新加载", Toast.LENGTH_SHORT).show();
+                    showingError = false;
+                    errorView.setVisibility(View.GONE);
+                    webView.reload();
+                });
+            }
+        };
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                manager.registerDefaultNetworkCallback(networkCallback);
+            } else {
+                manager.registerNetworkCallback(
+                        new NetworkRequest.Builder()
+                                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                                .build(),
+                        networkCallback);
+            }
+        } catch (Exception error) {
+            // 注册失败不影响主流程，错误页仍然可以手动点击重试
+            networkCallback = null;
+        }
+    }
+
+    /**
+     * 显示错误页。
+     *
+     * 末尾统一补上「当前服务器地址」—— 排查网络问题时这是首先要确认的信息，
+     * 而错误页上原来没有它，用户只能再去菜单里翻。文案也统一在这里收口，
+     * 避免各调用点各写一套"点此重试"。
+     */
     private void showError(String message) {
         showingError = true;
         progressBar.setVisibility(View.GONE);
-        errorView.setText(message);
+        String server = normalizeServerUrl(preferences().getString(KEY_SERVER_URL, DEFAULT_SERVER_URL));
+        errorView.setText(message
+                + "\n\n当前服务器：\n" + server
+                + "\n\n点屏幕任意位置重试"
+                + "（网络恢复后也会自动重试）");
         errorView.setVisibility(View.VISIBLE);
     }
 
@@ -2130,6 +2229,15 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         downloadCancelled = true;
         mainHandler.removeCallbacks(pageLoadWatchdog);
+        if (networkCallback != null) {
+            try {
+                ((ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE))
+                        .unregisterNetworkCallback(networkCallback);
+            } catch (Exception ignored) {
+                // 注销失败无副作用
+            }
+            networkCallback = null;
+        }
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (activeUpdateConnection != null) {
             activeUpdateConnection.disconnect();

@@ -243,8 +243,12 @@ final class RootViewController: UIViewController {
         store.webCacheVersion = JukuConfig.currentVersionCode
     }
 
+    /// 错误页统一在末尾补上「当前服务器地址」——排查网络问题时这是首先要确认的信息，
+    /// 原来错误页上没有它，用户只能再去菜单里翻（对应 Android 的 showError）。
     private func showError(_ message: String) {
-        errorLabel.text = message + "\n\n点此重试"
+        errorLabel.text = message
+            + "\n\n当前服务器：\n\(store.serverURL)"
+            + "\n\n点屏幕任意位置重试"
         errorContainer.isHidden = false
     }
 
@@ -415,16 +419,23 @@ final class RootViewController: UIViewController {
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
             ?? String(JukuConfig.currentVersionCode)
         let bundleID = Bundle.main.bundleIdentifier ?? "com.juku.mobile"
+        let system = UIDevice.current.systemName + " " + UIDevice.current.systemVersion
         let message = """
         应用：果果剧库 iOS 版
         版本：\(version) (build \(build))
         服务器：\(store.serverURL)
+        设备：\(UIDevice.current.model) / \(system)
         标识：\(bundleID)
 
         iOS 不允许应用自行安装更新包，检查到新版本后会跳转浏览器下载。
         """
         let alert = UIAlertController(title: "关于", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "关闭", style: .cancel))
+        alert.addAction(UIAlertAction(title: "复制信息", style: .default) { [weak self] _ in
+            // 整段复制，用户可一键粘贴发出来（对应 Android 的「复制信息」）
+            UIPasteboard.general.string = message
+            self?.presentToast("已复制，可直接粘贴发送")
+        })
         alert.addAction(UIAlertAction(title: "检查更新", style: .default) { [weak self] _ in
             self?.checkForUpdate(userInitiated: true)
         })
@@ -645,7 +656,7 @@ extension RootViewController: WKNavigationDelegate {
 
             \(error.localizedDescription)
 
-            请检查手机网络，或从右上角菜单检查服务器地址。
+            请检查手机网络是否正常；也可以在浏览器里打开下面的地址确认服务器是否可达。
             """
         }
         showError(detail)

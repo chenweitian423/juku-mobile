@@ -51,9 +51,11 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: |
-            platforms;android-35
-            build-tools;35.0.0
+          # 多个包必须用空格分隔。
+          # 用 YAML 的 `|` 写多行会被整体当成一个包名，
+          # 报 "Failed to find package 'platforms;android-35\nbuild-tools;35.0.0'"。
+          packages: "platforms;android-35 build-tools;35.0.0"
+          accept-android-sdk-licenses: true
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4

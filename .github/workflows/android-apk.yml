@@ -119,15 +119,24 @@ jobs:
           APKSIGNER="$BUILD_TOOLS/apksigner"
 
           echo "== apksigner verify =="
-          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          VERIFY_OUT=$("$APKSIGNER" verify --verbose --print-certs "$APK" 2>&1)
+          printf '%s\n' "$VERIFY_OUT"
 
-          CERT=$("$APKSIGNER" verify --print-certs "$APK" \
-                   | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1)
+          # 提取证书 SHA-256。刻意不匹配固定的行首前缀，因为不同 build-tools
+          # 版本的输出格式不同：
+          #   旧: "Signer #1 certificate SHA-256 digest: <hex>"
+          #   新: "V3.0 Signer: certificate SHA-256 digest: <hex>"
+          # 用 "certificate SHA-256 digest:" 定位可同时兼容两者，
+          # 且不会误取到 "public key SHA-256 digest:" 那一行。
+          CERT=$(printf '%s\n' "$VERIFY_OUT" \
+                   | grep -oE 'certificate SHA-256 digest: [0-9a-fA-F]{64}' \
+                   | head -n1 | awk '{print $NF}' | tr 'A-F' 'a-f' || true)
+          EXPECTED_LOWER=$(printf '%s' "$EXPECTED_CERT_SHA256" | tr 'A-F' 'a-f')
 
-          if [ "$CERT" != "$EXPECTED_CERT_SHA256" ]; then
+          if [ "$CERT" != "$EXPECTED_LOWER" ]; then
             echo "::error::签名证书与现役证书不一致，产物会让老用户无法覆盖升级"
-            echo "  期望: $EXPECTED_CERT_SHA256"
-            echo "  实际: $CERT"
+            echo "  期望: $EXPECTED_LOWER"
+            echo "  实际: ${CERT:-<未能从 apksigner 输出中解析出证书>}"
             exit 1
           fi
           echo "签名证书校验通过: $CERT"

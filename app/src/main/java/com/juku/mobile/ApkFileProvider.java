@@ -152,6 +152,11 @@ public class ApkFileProvider extends ContentProvider {
                 row[index] = file.getName();
             } else if (OpenableColumns.SIZE.equals(column)) {
                 row[index] = file.length();
+            } else if ("_data".equals(column)) {
+                // 部分 ROM 的安装器/安全扫描会先查 `_data` 拿真实路径再去读文件。
+                // 给它路径总比给 null 好（虽然私有目录其它 uid 读不到，
+                // 真正的解法是把包放进公共「下载」目录，见 MainActivity.publishApkToDownloads）。
+                row[index] = file.getAbsolutePath();
             } else {
                 row[index] = null;
             }

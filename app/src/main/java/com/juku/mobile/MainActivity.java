@@ -13,6 +13,8 @@ import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -31,6 +33,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.InputType;
 import android.text.method.LinkMovementMethod;
@@ -73,6 +76,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -92,8 +96,8 @@ public class MainActivity extends Activity {
     private static final String INSTALL_STATUS_ACTION = "com.juku.mobile.INSTALL_STATUS";
     private static final String DEFAULT_SERVER_URL = "https://duanju.sky423.cn:18888/";
     private static final String LEGACY_INTERNAL_HOST = "192.168.123.121";
-    private static final String CURRENT_VERSION_NAME = "1.3.13";
-    private static final int CURRENT_VERSION_CODE = 22;
+    private static final String CURRENT_VERSION_NAME = "1.3.14";
+    private static final int CURRENT_VERSION_CODE = 23;
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int INSTALL_PERMISSION_REQUEST = 1002;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1003;
@@ -122,6 +126,8 @@ public class MainActivity extends Activity {
     private TextView downloadStatus;
     private HttpURLConnection activeUpdateConnection;
     private volatile File pendingInstallFile;
+    /** 另存到公共「下载」目录的那份安装包（装成功后清掉，失败则留作手动安装的兜底）。 */
+    private Uri publishedApkUri;
     private boolean showingError;
     private boolean updateCheckRunning;
     private boolean autoUpdateChecked;
@@ -165,6 +171,15 @@ public class MainActivity extends Activity {
     private final BroadcastReceiver installResultReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            // ★ 必须先确认广播里真的带状态字段。
+            // 原来的写法是 getIntExtra(EXTRA_STATUS, STATUS_FAILURE)：万一收到一个
+            // 不带该字段的广播（厂商 ROM 包一层、或我们自己误注册到其它 action），
+            // 就会被**当成"安装失败(1)"**并显示"系统未返回具体原因" —— 白白把一次
+            // 可能正常的安装判成失败。异常路径绝不能靠默认值来触发。
+            if (intent == null || !intent.hasExtra(PackageInstaller.EXTRA_STATUS)) {
+                noteUpdateStep("收到不含状态字段的安装结果广播，已忽略");
+                return;
+            }
             int status = intent.getIntExtra(
                     PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
             String message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
@@ -180,6 +195,7 @@ public class MainActivity extends Activity {
             if (status == PackageInstaller.STATUS_SUCCESS) {
                 pendingInstallFile = null;
                 clearUpdateCache();
+                clearPublishedApk();
                 noteUpdateStep("安装成功");
                 Toast.makeText(MainActivity.this, "更新安装完成", Toast.LENGTH_SHORT).show();
                 return;
@@ -891,6 +907,24 @@ public class MainActivity extends Activity {
                 //noinspection ResultOfMethodCallIgnored
                 file.delete();
             }
+        }
+    }
+
+    /**
+     * 安装成功后清掉「下载」目录里的那份副本。
+     * 安装**失败**时刻意保留 —— 那是用户手动安装的兜底路径
+     * （界面上也提示了"可到下载文件夹手动点击安装"）。
+     */
+    private void clearPublishedApk() {
+        Uri uri = publishedApkUri;
+        publishedApkUri = null;
+        if (uri == null) {
+            return;
+        }
+        try {
+            getContentResolver().delete(uri, null, null);
+        } catch (Exception error) {
+            Log.w(LOG_TAG, "清理下载目录副本失败: " + error);
         }
     }
 
@@ -1813,21 +1847,107 @@ public class MainActivity extends Activity {
      * 改为 ACTION_VIEW + setDataAndType，让系统以「打开 APK 文件」的标准链路
      * 触发安装器，兼容性明显更好；若系统只有一个安装器入口，行为一致。
      */
+    /**
+     * 把更新包另存一份到**公共「下载」目录**，返回可直接交给系统安装器的 URI。
+     *
+     * ★ 为什么不只用自有 provider（这是「Failed opening content provider」的真正症结）：
+     *
+     * 更新包原本下载在应用私有的 `cache/updates/` 下。该目录**其它 uid 读不到**
+     * （`/data/data/<pkg>` 只有本应用和 root 能进）。而安装一条 APK，
+     * 读这个包的**不止系统安装器**：厂商 ROM（MIUI/HyperOS 等）在弹出安装界面之前，
+     * 会由「安全中心 / 病毒扫描」这类**独立进程**先读一遍安装包
+     * （界面上那句「安装包扫描中，请稍候」就是它）。
+     *
+     * 这类扫描进程通常按**文件路径**（MediaStore 的 `_data` 列）去读文件，
+     * 而不是走 `openInputStream()` —— 把私有目录的路径给它，它照样读不到，
+     * 于是报出那句含糊的「解析软件包时出现问题。(11) Failed opening content provider」。
+     * 即使把 provider 导出（1.3.12 做了）也救不了：问题不在权限，在**文件本身不可达**。
+     *
+     * 放进公共「下载」目录后：
+     * - 任何进程都能按路径读到这个文件；
+     * - URI 由系统 media provider 提供，**不依赖我们的进程是否还活着**；
+     * - 顺带给了用户一条兜底路径 —— 自动安装失败时，可以直接去「下载」文件夹
+     *   手动点一下安装，不必重新下载。
+     *
+     * Android 10 以下没有 MediaStore.Downloads，沿用自有 provider（老 ROM 没有这类扫描步骤）。
+     */
+    private Uri publishApkToDownloads(File apk) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return null;
+        }
+        ContentResolver resolver = getContentResolver();
+        String displayName = apk.getName();
+        // 先清掉同名的旧项，避免「下载」里堆一串历史安装包
+        try {
+            resolver.delete(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    MediaStore.MediaColumns.DISPLAY_NAME + "=?",
+                    new String[]{displayName});
+        } catch (Exception ignored) {
+            // 删不掉不影响新建
+        }
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME, displayName);
+        values.put(MediaStore.MediaColumns.MIME_TYPE,
+                "application/vnd.android.package-archive");
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+        values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+        Uri item = null;
+        try {
+            item = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (item == null) {
+                return null;
+            }
+            try (OutputStream output = resolver.openOutputStream(item);
+                 FileInputStream input = new FileInputStream(apk)) {
+                if (output == null) {
+                    throw new IOException("无法打开目标文件");
+                }
+                byte[] buffer = new byte[64 * 1024];
+                int count;
+                while ((count = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, count);
+                }
+                output.flush();
+            }
+            values.clear();
+            values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+            resolver.update(item, values, null, null);
+            return item;
+        } catch (Exception error) {
+            Log.w(LOG_TAG, "导出安装包到下载目录失败: " + error);
+            if (item != null) {
+                try {
+                    resolver.delete(item, null, null);
+                } catch (Exception ignored) {
+                    // 清理失败无所谓，下次同名会被覆盖
+                }
+            }
+            return null;
+        }
+    }
+
     private void installWithViewer(File apk) {
         noteUpdateStep("改用系统安装器打开：" + apk.getName() + "（" + apk.length() + " B）");
-        Uri uri = ApkFileProvider.uriForFile(this, apk);
+        // 优先用公共「下载」目录里的副本：私有 cache 里的文件厂商扫描进程读不到
+        Uri publicUri = publishApkToDownloads(apk);
+        Uri uri = publicUri != null ? publicUri : ApkFileProvider.uriForFile(this, apk);
         String mime = "application/vnd.android.package-archive";
+        if (publicUri != null) {
+            publishedApkUri = publicUri;
+            noteUpdateStep("已另存到「下载」文件夹（供扫描进程按路径读取）");
+        }
 
         Intent viewIntent = new Intent(Intent.ACTION_VIEW);
         viewIntent.setDataAndType(uri, mime);
         viewIntent.setClipData(ClipData.newUri(getContentResolver(), "果果剧库更新", uri));
-        // 授权给安装器本身；但注意国产 ROM 的「安全扫描」是独立进程，拿不到这个授权，
-        // 所以 provider 必须导出（见 ApkFileProvider 的类注释）。
         viewIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         viewIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
             startActivity(viewIntent);
             noteUpdateStep("已拉起系统安装器（ACTION_VIEW）");
+            Toast.makeText(this,
+                    "若系统没有自动安装，可到「下载」文件夹手动点击安装包",
+                    Toast.LENGTH_LONG).show();
             return;
         } catch (ActivityNotFoundException | SecurityException ignored) {
             // 继续尝试 ACTION_INSTALL_PACKAGE 作为兜底
@@ -1841,10 +1961,14 @@ public class MainActivity extends Activity {
         try {
             startActivity(installIntent);
             noteUpdateStep("已拉起系统安装器（ACTION_INSTALL_PACKAGE）");
+            Toast.makeText(this,
+                    "若系统没有自动安装，可到「下载」文件夹手动点击安装包",
+                    Toast.LENGTH_LONG).show();
         } catch (ActivityNotFoundException | SecurityException error) {
             noteUpdateStep("找不到可用的系统安装器：" + updateError(error));
             Toast.makeText(this,
-                    "没有找到系统安装器，请到浏览器打开下载页手动安装", Toast.LENGTH_LONG).show();
+                    "自动安装不可用：安装包已保存到「下载」文件夹，请到文件管理器里点击安装",
+                    Toast.LENGTH_LONG).show();
         }
     }
 
